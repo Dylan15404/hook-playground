@@ -10,5 +10,5 @@ windows-core = "0.58.0"
 git = "https://github.com/microsoft/windows-rs"
 features = [
     "Win32_System_Diagnostics_Debug",
-    "Win32_System_LibraryLoader",
+    "Win32_System_LibraryLoader"
 ]
