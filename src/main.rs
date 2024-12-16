@@ -1,94 +1,72 @@
-use windows::{core::*, Win32::System::LibraryLoader::{LoadLibraryExA, GetModuleHandleA, GetProcAddress, LOAD_LIBRARY_FLAGS}};
 use std::slice;
-use windows::Win32::Foundation::{HMODULE};
-
+use std::ffi::{c_void, CStr};
+use windows::{
+    core::*,
+    Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32, TH32CS_SNAPPROCESS, Process32First, Process32Next},
+    Win32::System::Diagnostics::Debug::sfMax,
+    Win32::System::LibraryLoader::{LoadLibraryExA, GetModuleHandleA, GetProcAddress, LOAD_LIBRARY_FLAGS},
+    Win32::Foundation::{HMODULE, INVALID_HANDLE_VALUE, E_FAIL, CloseHandle, HANDLE},
+    Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION},
+};
 const COMPARE_LENGTH: usize = 14;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
 const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
 
-fn get_clean_fn(mod_name : &str, fn_name: &str) -> unsafe extern "system" fn() -> isize {
-    //convert input strings to PCSTR
-    let pcstr_mod_name = PCSTR::from_raw(mod_name.as_ptr());
-    let pcstr_fn_name = PCSTR::from_raw(fn_name.as_ptr());
 
-    //Get the Address of the function from the library in disk
-    let h_module = unsafe { GetModuleHandleA(pcstr_mod_name) }
-        .expect("Failed to get module handle");
-
-    //Get the Address of the function from the library
-    let target_func = unsafe { GetProcAddress(h_module, pcstr_fn_name) }
-        .expect("Failed to get function address");
-
-    target_func
-}
-
-fn read_prologue_from_process(pid: u32, function_address: usize, size: usize) -> Option<Vec<u8>> {
-    let process_handle = unsafe { OpenProcess(PROCESS_VM_READ, 0, pid) };
-    if process_handle.is_null() {
-        return None;
-    }
-
-    let mut buffer = vec![0; size];
-    let mut bytes_read = 0;
-    let result = unsafe {
-        ReadProcessMemory(
-            process_handle,
-            function_address as *const _,
-            buffer.as_mut_ptr() as *mut _,
-            size,
-            &mut bytes_read,
-        )
-    };
-
-    if result != 0 {
-        Some(buffer)
-    } else {
-        None
-    }
-}
-
-fn compare_prologues(fn_clean: &unsafe extern "system" fn() -> isize, fn_dirty: &unsafe extern "system" fn() -> isize, function_name: &str) -> bool {
+fn get_pid(process_name: &str) -> Result<Option<u32>> {
     unsafe {
-        let clean_slice = slice::from_raw_parts(*fn_clean as *const u8, COMPARE_LENGTH);
-        let dirty_slice = slice::from_raw_parts(*fn_dirty as *const u8, COMPARE_LENGTH);
-
-        if clean_slice != dirty_slice {
-            println!("Inline hook detected in {}!", function_name);
-            return true;
+        // Create a snapshot of all the processes
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(windows::core::Error::from_win32());
         }
+
+        let mut entry = PROCESSENTRY32 {
+            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+            ..Default::default()
+        };
+
+        // Start enumerating processes
+        if Process32First(snapshot, &mut entry).is_ok() {
+            loop {
+                // Check if the current process name matches the target process name
+                let exe_name = CStr::from_ptr(entry.szExeFile.as_ptr()).to_string_lossy();
+                if exe_name.to_lowercase() == process_name.to_lowercase() {
+                    // Found the process, return its PID
+                    return Ok(Some(entry.th32ProcessID));
+                }
+
+
+                // Move to the next process
+                if !Process32Next(snapshot, &mut entry).is_ok() {
+                    break;
+                }
+            }
+        }
+
+        Err(windows::core::Error::from_win32())
     }
-    false
 }
 
-fn detect_inline(mod_name : &str, fn_name: &str) -> (){
-
-    let target_process_id: u32 = 1234; // Example process ID
-
-    //convert input strings to PCSTR
-    let pcstr_mod_name = PCSTR::from_raw(mod_name.as_ptr());
-    let pcstr_fn_name = PCSTR::from_raw(fn_name.as_ptr());
-
-    //set flags for library loading
-    let flags = LOAD_LIBRARY_FLAGS(LOAD_LIBRARY_AS_IMAGE_RESOURCE);
-
-    //Load Library as module with relevant flags
-    let h_module = unsafe { LoadLibraryExA(pcstr_mod_name, None, flags) }
-        .expect("Failed to load library from memory");
-
-    let dirty_fn = get_dirty_fn(h_module, pcstr_fn_name);
-    let clean_fn = get_clean_fn(h_module, pcstr_fn_name);
-}
 
 fn main() {
-    let mod_name = "user32.dll";
-    let fn_name = "MessageBoxA";
+    // Example code:
 
-    let fn_clean = get_clean_fn(mod_name, fn_name);
-    let fn_dirty = get_dirty_fn(mod_name, fn_name);
+    // processes to look for
+    let processes_to_check = vec!["notepad.exe", "msedge.exe", "cmd.exe"];
 
-    if compare_prologues(&fn_clean, &fn_dirty, fn_name) {
-        println!("Hook detected!");
-    } else {
-        println!("No hook detected.");
+    for process_name in processes_to_check {
+        match get_pid(process_name) {
+            Ok(Some(pid)) => println!("Process '{}' found with PID: {}", process_name, pid),
+            Ok(None) => println!("Process '{}' not found", process_name),
+            Err(e) => println!("Error occurred while searching for '{}': {:?}", process_name, e),
+        }
+    }
+
+    // Additional test for a process that doesn't exist
+    match get_pid("thisprocessdoesntexist.exe") {
+        Ok(Some(_)) => println!("Unexpectedly found a nonexistent process!"),
+        Ok(None) => println!("As expected, 'thisprocessdoesntexist.exe' was not found"),
+        Err(e) => println!("Error occurred while searching for a nonexistent process: {:?}", e),
     }
 }
