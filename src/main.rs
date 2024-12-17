@@ -6,7 +6,7 @@ use windows::{
     Win32::System::Diagnostics::Debug::sfMax,
     Win32::System::LibraryLoader::{LoadLibraryExA, GetModuleHandleA, GetProcAddress, LOAD_LIBRARY_FLAGS},
     Win32::Foundation::{HMODULE, INVALID_HANDLE_VALUE, E_FAIL, CloseHandle, HANDLE},
-    Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION},
+    Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, GetExitCodeProcess},
 };
 const COMPARE_LENGTH: usize = 14;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
@@ -48,25 +48,55 @@ fn get_pid(process_name: &str) -> Result<Option<u32>> {
     }
 }
 
+fn get_handle(pid: u32) -> Result<HANDLE> {
+    unsafe {
+        let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)?;
+        if process_handle == INVALID_HANDLE_VALUE {
+            return Err(Error::from_win32());
+        }
+        Ok(process_handle)
+    }
+}
 
-fn main() {
-    // Example code:
-
-    // processes to look for
-    let processes_to_check = vec!["notepad.exe", "msedge.exe", "cmd.exe"];
-
-    for process_name in processes_to_check {
-        match get_pid(process_name) {
-            Ok(Some(pid)) => println!("Process '{}' found with PID: {}", process_name, pid),
-            Ok(None) => println!("Process '{}' not found", process_name),
-            Err(e) => println!("Error occurred while searching for '{}': {:?}", process_name, e),
+fn check_process_handle(handle: HANDLE) -> Result<()> {
+    unsafe {
+        // Check if the handle is valid by querying the exit code of the process
+        let mut exit_code = 0;
+        if GetExitCodeProcess(handle, &mut exit_code).is_ok() {
+            if exit_code != 259 { // 259 indicates the process is still running
+                println!("Process exited with code: {}", exit_code);
+            } else {
+                println!("Process is still running.");
+            }
+        } else {
+            return Err(Error::from_win32());
         }
     }
 
-    // Additional test for a process that doesn't exist
-    match get_pid("thisprocessdoesntexist.exe") {
-        Ok(Some(_)) => println!("Unexpectedly found a nonexistent process!"),
-        Ok(None) => println!("As expected, 'thisprocessdoesntexist.exe' was not found"),
-        Err(e) => println!("Error occurred while searching for a nonexistent process: {:?}", e),
+    Ok(())
+}
+
+fn main() {
+    // Example PID for testing
+    let pid_result = get_pid("msedge.exe").unwrap().unwrap();
+
+    match get_handle(pid_result) {
+        Ok(handle) => {
+            println!("Successfully obtained handle: {:?}", handle);
+
+            // Check if the process handle is valid
+            if let Err(e) = check_process_handle(handle) {
+                eprintln!("Failed to check handle: {:?}", e);
+            }
+
+            // Remember to close the handle when done
+            unsafe {
+                CloseHandle(handle);
+                println!("Handle closed.");
+            }
+        }
+        Err(e) => {
+            eprintln!("Error getting handle: {:?}", e);
+        }
     }
 }
