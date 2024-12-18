@@ -2,43 +2,78 @@ use std::slice;
 use std::ffi::{c_void, CStr};
 use windows::{
     core::*,
-    Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32, TH32CS_SNAPPROCESS, Process32First, Process32Next},
-    Win32::System::Diagnostics::Debug::sfMax,
-    Win32::System::LibraryLoader::{LoadLibraryExA, GetModuleHandleA, GetProcAddress, LOAD_LIBRARY_FLAGS},
-    Win32::Foundation::{HMODULE, INVALID_HANDLE_VALUE, E_FAIL, CloseHandle, HANDLE},
-    Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, GetExitCodeProcess},
+    Win32::{
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot,
+                PROCESSENTRY32,
+                MODULEENTRY32,
+                TH32CS_SNAPPROCESS,
+                TH32CS_SNAPMODULE,
+                Process32First,
+                Process32Next,
+                Module32First,
+                Module32Next
+            },
+            Threading::{
+                OpenProcess,
+                PROCESS_ALL_ACCESS,
+                PROCESS_QUERY_INFORMATION,
+                PROCESS_VM_READ,
+                GetExitCodeProcess
+            },
+            Diagnostics::Debug::sfMax,
+            LibraryLoader::{
+                LoadLibraryExA,
+                GetModuleHandleA,
+                GetProcAddress,
+                LOAD_LIBRARY_FLAGS
+            },
+
+        },
+        Foundation::{
+            HMODULE,
+            INVALID_HANDLE_VALUE,
+            E_FAIL,
+            CloseHandle,
+            HANDLE
+        },
+    }
 };
+
+use windows::Win32::System::Diagnostics::ToolHelp::{};
+
 const COMPARE_LENGTH: usize = 14;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
 const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
 
-
+//function to get the pid of a process with a given name
 fn get_pid(process_name: &str) -> Result<Option<u32>> {
     unsafe {
-        // Create a snapshot of all the processes
+        // create a snapshot of all the processes
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
         if snapshot == INVALID_HANDLE_VALUE {
             return Err(windows::core::Error::from_win32());
         }
 
-        let mut entry = PROCESSENTRY32 {
+        let mut process_entry = PROCESSENTRY32 {
             dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
             ..Default::default()
         };
 
-        // Start enumerating processes
-        if Process32First(snapshot, &mut entry).is_ok() {
+        // enumerate processes in snapshot
+        if Process32First(snapshot, &mut process_entry).is_ok() {
             loop {
-                // Check if the current process name matches the target process name
-                let exe_name = CStr::from_ptr(entry.szExeFile.as_ptr()).to_string_lossy();
-                if exe_name.to_lowercase() == process_name.to_lowercase() {
+                //check if the current process name matches the target process name
+                let exe_name = CStr::from_ptr(process_entry.szExeFile.as_ptr()).to_string_lossy();
+                if exe_name.eq_ignore_ascii_case(process_name) {
                     // Found the process, return its PID
-                    return Ok(Some(entry.th32ProcessID));
+                    return Ok(Some(process_entry.th32ProcessID));
                 }
 
 
                 // Move to the next process
-                if !Process32Next(snapshot, &mut entry).is_ok() {
+                if !Process32Next(snapshot, &mut process_entry).is_ok() {
                     break;
                 }
             }
@@ -48,6 +83,7 @@ fn get_pid(process_name: &str) -> Result<Option<u32>> {
     }
 }
 
+//function to get the handle of a process with a given pid
 fn get_handle(pid: u32) -> Result<HANDLE> {
     unsafe {
         let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)?;
@@ -60,7 +96,7 @@ fn get_handle(pid: u32) -> Result<HANDLE> {
 
 fn check_process_handle(handle: HANDLE) -> Result<()> {
     unsafe {
-        // Check if the handle is valid by querying the exit code of the process
+        // check if the handle is valid by querying the exit code of the process
         let mut exit_code = 0;
         if GetExitCodeProcess(handle, &mut exit_code).is_ok() {
             if exit_code != 259 { // 259 indicates the process is still running
@@ -76,27 +112,49 @@ fn check_process_handle(handle: HANDLE) -> Result<()> {
     Ok(())
 }
 
+//function to retrieve a module base address in the remote process
+fn get_module_base_address(process_handle: HANDLE, module_name: &str) -> Option<usize> {
+    unsafe {
+        // Create a snapshot of the modules in the process
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, process_handle.0 as u32).ok()?;
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        // initialise the module entry
+        let mut module_entry = MODULEENTRY32 {
+            dwSize: std::mem::size_of::<MODULEENTRY32>() as u32,
+            ..Default::default()
+        };
+
+
+        // iterate through modules to find the target module
+        if Module32First(snapshot, &mut module_entry).is_ok() {
+            loop {
+                let module_name_current = std::ffi::CStr::from_ptr(module_entry.szModule.as_ptr()); // this on is different
+                if let Ok(name) = module_name_current.to_str() {
+                    if name.eq_ignore_ascii_case(module_name) {
+                        return Some(module_entry.modBaseAddr as usize);
+                    }
+                }
+                if !Module32Next(snapshot, &mut module_entry).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
+
+
 fn main() {
     // Example PID for testing
     let pid_result = get_pid("msedge.exe").unwrap().unwrap();
 
-    match get_handle(pid_result) {
-        Ok(handle) => {
-            println!("Successfully obtained handle: {:?}", handle);
+    let handle = get_handle(pid_result).unwrap();
 
-            // Check if the process handle is valid
-            if let Err(e) = check_process_handle(handle) {
-                eprintln!("Failed to check handle: {:?}", e);
-            }
-
-            // Remember to close the handle when done
-            unsafe {
-                CloseHandle(handle);
-                println!("Handle closed.");
-            }
-        }
-        Err(e) => {
-            eprintln!("Error getting handle: {:?}", e);
-        }
-    }
+    let module_base_address = get_module_base_address(handle, "kernel32.dll").unwrap();
+    
+    check_process_handle(handle).unwrap();
 }
