@@ -1,5 +1,6 @@
 use std::slice;
-use std::ffi::{c_void, CStr};
+use std::ffi::{c_void, CStr, CString};
+use std::ptr::null_mut;
 use windows::{
     core::*,
     Win32::{
@@ -20,7 +21,8 @@ use windows::{
                 PROCESS_ALL_ACCESS,
                 PROCESS_QUERY_INFORMATION,
                 PROCESS_VM_READ,
-                GetExitCodeProcess
+                GetExitCodeProcess,
+                PROCESS_ACCESS_RIGHTS
             },
             Diagnostics::Debug::sfMax,
             LibraryLoader::{
@@ -28,6 +30,10 @@ use windows::{
                 GetModuleHandleA,
                 GetProcAddress,
                 LOAD_LIBRARY_FLAGS
+            },
+            ProcessStatus::{
+                MODULEINFO,
+                GetModuleInformation
             },
 
         },
@@ -40,8 +46,6 @@ use windows::{
         },
     }
 };
-
-use windows::Win32::System::Diagnostics::ToolHelp::{};
 
 const COMPARE_LENGTH: usize = 14;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
@@ -56,6 +60,7 @@ fn get_pid(process_name: &str) -> Result<Option<u32>> {
             return Err(windows::core::Error::from_win32());
         }
 
+        // initialise the process entry
         let mut process_entry = PROCESSENTRY32 {
             dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
             ..Default::default()
@@ -72,7 +77,7 @@ fn get_pid(process_name: &str) -> Result<Option<u32>> {
                 }
 
 
-                // Move to the next process
+                // move to the next process
                 if !Process32Next(snapshot, &mut process_entry).is_ok() {
                     break;
                 }
@@ -83,10 +88,10 @@ fn get_pid(process_name: &str) -> Result<Option<u32>> {
     }
 }
 
-//function to get the handle of a process with a given pid
+// function to get the handle of a process with a given pid
 fn get_handle(pid: u32) -> Result<HANDLE> {
     unsafe {
-        let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)?;
+        let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_ALL_ACCESS, false, pid)?;
         if process_handle == INVALID_HANDLE_VALUE {
             return Err(Error::from_win32());
         }
@@ -112,7 +117,7 @@ fn check_process_handle(handle: HANDLE) -> Result<()> {
     Ok(())
 }
 
-//function to retrieve a module base address in the remote process
+// function to retrieve a module base address in the dirty process
 fn get_module_base_address(process_handle: HANDLE, module_name: &str) -> Option<usize> {
     unsafe {
         // Create a snapshot of the modules in the process
@@ -146,6 +151,49 @@ fn get_module_base_address(process_handle: HANDLE, module_name: &str) -> Option<
     None
 }
 
+// Helper function to get module information (base address, size, etc.)
+unsafe fn get_module_info(module_handle: HMODULE, process_handle: HANDLE) -> Option<MODULEINFO> {
+    let mut module_info: MODULEINFO = std::mem::zeroed();
+    // Cast module_handle to HMODULE here for compatibility with GetModuleInformation
+    if GetModuleInformation(process_handle, module_handle, &mut module_info, std::mem::size_of::<MODULEINFO>() as u32).is_ok(){
+        return Some(module_info);
+    }
+    None
+}
+
+// function to get the address of a given function from a dirty process
+fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, function_name: &str) -> Option<usize> {
+    unsafe {
+        // Get the base address of the module in the target process
+        let module_base = get_module_base_address(process_handle, module_name)?;
+
+        // Get the local handle of the module
+        let module_handle_result = GetModuleHandleA(PCSTR(module_name.as_ptr() as *const u8));
+        if module_handle_result.is_ok() {
+            return None;
+        }
+
+        let module_handle = module_handle_result.unwrap();
+
+        // Get the local address of the function in the current process
+        let local_proc_address = GetProcAddress(module_handle, PCSTR(function_name.as_ptr() as *const u8));
+        if local_proc_address == *null_mut() {
+            return None;
+        }
+
+        // Calculate the offset of the function within the module
+        let module_info: MODULEINFO = get_module_info(module_handle, process_handle)?;
+        let function_offset = local_proc_address.unwrap() as usize - module_info.lpBaseOfDll as usize;
+
+
+
+        // Calculate the offset of the function within the module
+        let target_function_address_offset = module_base as usize + function_offset;
+
+        // Calculate the remote address of the function
+        Some(target_function_address_offset)
+    }
+}
 
 
 fn main() {
@@ -155,6 +203,6 @@ fn main() {
     let handle = get_handle(pid_result).unwrap();
 
     let module_base_address = get_module_base_address(handle, "kernel32.dll").unwrap();
-    
+
     check_process_handle(handle).unwrap();
 }
