@@ -1,6 +1,6 @@
 use std::slice;
 use std::ffi::{c_void, CStr, CString};
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use windows::{
     core::*,
     Win32::{
@@ -118,10 +118,10 @@ fn check_process_handle(handle: HANDLE) -> Result<()> {
 }
 
 // function to retrieve a module base address in the dirty process
-fn get_module_base_address(process_handle: HANDLE, module_name: &str) -> Option<usize> {
+fn get_module_base_address(process_handle: HANDLE, module_name: &str, pid: u32) -> Option<usize> {
     unsafe {
         // Create a snapshot of the modules in the process
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, process_handle.0 as u32).ok()?;
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid).ok()?;
         if snapshot == INVALID_HANDLE_VALUE {
             return None;
         }
@@ -162,30 +162,40 @@ unsafe fn get_module_info(module_handle: HMODULE, process_handle: HANDLE) -> Opt
 }
 
 // function to get the address of a given function from a dirty process
-fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, function_name: &str) -> Option<usize> {
+fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, function_name: &str, pid: u32) -> Option<usize> {
     unsafe {
+
         // Get the base address of the module in the target process
-        let module_base = get_module_base_address(process_handle, module_name)?;
+        let module_base = get_module_base_address(process_handle, module_name, pid).unwrap();
+
+        // get the module name as a c string for PCSTR
+        let module_name_cstr = CString::new(module_name).unwrap();
 
         // Get the local handle of the module
-        let module_handle_result = GetModuleHandleA(PCSTR(module_name.as_ptr() as *const u8));
-        if module_handle_result.is_ok() {
+        let module_handle_result = GetModuleHandleA(PCSTR(module_name_cstr.as_ptr() as *const u8));
+        if !module_handle_result.is_ok() {
             return None;
         }
 
+        // unwrap the module handle from the result
         let module_handle = module_handle_result.unwrap();
 
+        // get the function name as a c string for PCSTR
+        let function_name_cstr = CString::new(function_name).unwrap();
+
+
         // Get the local address of the function in the current process
-        let local_proc_address = GetProcAddress(module_handle, PCSTR(function_name.as_ptr() as *const u8));
-        if local_proc_address == *null_mut() {
+        let local_proc_address = GetProcAddress(module_handle, PCSTR(function_name_cstr.as_ptr() as *const u8));
+        if local_proc_address.is_none() {
             return None;
+
         }
 
         // Calculate the offset of the function within the module
-        let module_info: MODULEINFO = get_module_info(module_handle, process_handle)?;
+        let module_info: MODULEINFO = get_module_info(module_handle, process_handle).unwrap();
+
+        //get function offset from the module base to the function start
         let function_offset = local_proc_address.unwrap() as usize - module_info.lpBaseOfDll as usize;
-
-
 
         // Calculate the offset of the function within the module
         let target_function_address_offset = module_base as usize + function_offset;
@@ -202,7 +212,9 @@ fn main() {
 
     let handle = get_handle(pid_result).unwrap();
 
-    let module_base_address = get_module_base_address(handle, "kernel32.dll").unwrap();
+    let module_base_address = get_module_base_address(handle, "user32.dll", pid_result).unwrap();
+
+    let dirty_function_address = get_dirty_function_address(handle, "kernel32.dll", "CopyFileW", pid_result).unwrap();
 
     check_process_handle(handle).unwrap();
 }
