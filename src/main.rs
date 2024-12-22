@@ -120,7 +120,7 @@ fn check_process_handle(handle: HANDLE) -> Result<()> {
 }
 
 // function to retrieve a module base address in the dirty process
-fn get_module_base_address(process_handle: HANDLE, module_name: &str, pid: u32) -> Result<Option<usize>> {
+fn get_remote_module_base(process_handle: HANDLE, module_name: &str, pid: u32) -> Result<Option<usize>> {
     unsafe {
         // Create a snapshot of the modules in the process
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
@@ -188,14 +188,14 @@ fn check_function_in_module(function_address: usize, module_info: MODULEINFO)->b
 // function to get the address of a given function from a dirty process
 fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, function_name: &str, pid: u32) -> std::result::Result<Option<usize>, Error> {
     unsafe {
-        // get the base address of the module in the target process
-        let module_base = get_module_base_address(process_handle, module_name, pid)?;
+        // Step 1 : get the base address of the module in the target process
+        let remote_module_base = get_remote_module_base(process_handle, module_name, pid).unwrap().unwrap();
 
         // get the local handle of the module
         let module_name_cstr = CString::new(module_name).unwrap();
         let module_handle_result = GetModuleHandleA(PCSTR(module_name_cstr.as_ptr() as *const u8));
         if !module_handle_result.is_ok() {
-            return Err(windows::core::Error::from_win32());
+            return Err(Error::from_win32());
         }
 
         // unwrap the module handle from the result
@@ -206,19 +206,19 @@ fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, functio
 
 
         // get the local address of the function in the current process
-        let local_proc_address = GetProcAddress(module_handle, PCSTR(function_name_cstr.as_ptr() as *const u8));
-        if local_proc_address.is_none() {
+        let local_function_address = GetProcAddress(module_handle, PCSTR(function_name_cstr.as_ptr() as *const u8));
+        if local_function_address.is_none() {
             return Ok(None);
         }
 
-        // Step 1: Get the module information from the target process
+        // Step 2: Get the module information from the target process
         let module_info: MODULEINFO = get_module_info(module_handle, process_handle)?;
 
         // Step 2: Calculate the offset of the function in the local process
-        let function_offset = local_proc_address.unwrap() as usize - module_info.lpBaseOfDll as usize;
+        let function_offset = local_function_address.unwrap() as usize - module_info.lpBaseOfDll as usize;
 
         // Step 3: Calculate the absolute address of the function in the remote process
-        let remote_function_address = module_info.lpBaseOfDll as usize + function_offset;
+        let remote_function_address = remote_module_base + function_offset;
 
         Ok(Some(remote_function_address))  // Return the calculated absolute address
     }
