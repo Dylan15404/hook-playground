@@ -3,6 +3,9 @@ name = "hook-playground"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+capstone = "0.12.0"
+
 [dependencies.windows]
 git = "https://github.com/microsoft/windows-rs"
 features = [

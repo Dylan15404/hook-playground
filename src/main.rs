@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::slice;
 use std::ffi::{c_void, CStr, CString};
 use std::ptr::{null, null_mut, read};
@@ -65,7 +66,7 @@ fn get_pid(process_name: &str) -> std::result::Result<u32, Error> {
 
         // initialise the process entry
         let mut process_entry = PROCESSENTRY32 {
-            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+            dwSize: size_of::<PROCESSENTRY32>() as u32,
             ..Default::default()
         };
 
@@ -91,14 +92,24 @@ fn get_pid(process_name: &str) -> std::result::Result<u32, Error> {
 }
 
 // function to get the handle of a process with a given pid
-fn get_handle(pid: u32) -> std::result::Result<HANDLE, Error> {
+fn get_process_handle(process_id: u32) -> Result<HANDLE> {
     unsafe {
-        let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_ALL_ACCESS, false, pid)?;
+        let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_ALL_ACCESS, false, process_id)?;
         if process_handle == INVALID_HANDLE_VALUE {
             return Err(Error::from_win32());
         }
         Ok(process_handle)
     }
+}
+
+unsafe fn get_module_handle(module_name: &str) -> std::result::Result<HMODULE, Error> {
+    let module_name_cstr = CString::new(module_name).unwrap();
+    let module_handle_result = GetModuleHandleA(PCSTR(module_name_cstr.as_ptr() as *const u8));
+    if !module_handle_result.is_ok() {
+        return Err(Error::from_win32());
+    }
+    let module_handle = module_handle_result.unwrap();
+    Ok(module_handle)
 }
 
 fn check_process_handle(handle: HANDLE) -> Result<()> {
@@ -120,27 +131,36 @@ fn check_process_handle(handle: HANDLE) -> Result<()> {
 }
 
 // function to retrieve a module base address in the dirty process
-fn get_remote_module_base(process_handle: HANDLE, module_name: &str, pid: u32) -> Result<Option<usize>> {
+fn get_remote_module_base( module_name: &str, pid: u32) -> Result<Option<usize>> {
     unsafe {
         // Create a snapshot of the modules in the process
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
         if snapshot == INVALID_HANDLE_VALUE {
             return Err(Error::from_win32());
         }
+        println!("Creating snapshot for PID: {}", pid);
+        println!("Snapshot handle: {:?}", snapshot);
 
         // Initialise the module entry
         let mut module_entry = MODULEENTRY32 {
-            dwSize: std::mem::size_of::<MODULEENTRY32>() as u32,
+            dwSize: size_of::<MODULEENTRY32>() as u32,
             ..Default::default()
         };
+        println!("Module entry size: {}", size_of::<MODULEENTRY32>());
 
         // Iterate through modules to find the target module
         if Module32First(snapshot, &mut module_entry).is_ok() {
             loop {
                 let module_name_current = CStr::from_ptr(module_entry.szModule.as_ptr());
                 if let Ok(name) = module_name_current.to_str() {
+                    println!("Found module: {} at base address: {:#x}", name, module_entry.modBaseAddr as usize);
+                } else {
+                    println!("Failed to convert module name to string.");
+                }
+                if let Ok(name) = module_name_current.to_str() {
                     if name.eq_ignore_ascii_case(module_name) {
                         // Module found, return its base address
+
                         println!("Module found: {} at base address: {:#x}", name, module_entry.modBaseAddr as usize);
                         return Ok(Some(module_entry.modBaseAddr as usize));
                     }
@@ -161,7 +181,7 @@ fn get_remote_module_base(process_handle: HANDLE, module_name: &str, pid: u32) -
 unsafe fn get_module_info(module_handle: HMODULE, process_handle: HANDLE) -> std::result::Result<MODULEINFO, Error> {
     // Attempt to retrieve module information
     let mut module_info = MODULEINFO::default(); // Default initialization
-    let result = GetModuleInformation(process_handle, module_handle, &mut module_info, std::mem::size_of::<MODULEINFO>() as u32);
+    let result = GetModuleInformation(process_handle, module_handle, &mut module_info, size_of::<MODULEINFO>() as u32);
 
     if result.is_ok() {
         Ok(module_info) // Return module info if successful
@@ -189,23 +209,17 @@ fn check_function_in_module(function_address: usize, module_info: MODULEINFO)->b
 fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, function_name: &str, pid: u32) -> std::result::Result<Option<usize>, Error> {
     unsafe {
         // Step 1 : get the base address of the module in the target process
-        let remote_module_base = get_remote_module_base(process_handle, module_name, pid).unwrap().unwrap();
+        let remote_module_base = get_remote_module_base(module_name, pid)?.unwrap();
 
-        // get the local handle of the module
-        let module_name_cstr = CString::new(module_name).unwrap();
-        let module_handle_result = GetModuleHandleA(PCSTR(module_name_cstr.as_ptr() as *const u8));
-        if !module_handle_result.is_ok() {
-            return Err(Error::from_win32());
-        }
 
         // unwrap the module handle from the result
-        let module_handle = module_handle_result?;
+        let module_handle = get_module_handle(module_name)?;
 
         // get the function name as a c string for PCSTR
         let function_name_cstr = CString::new(function_name).unwrap();
 
 
-        // get the local address of the function in the current process
+        // get the offset local address of the function
         let local_function_address = GetProcAddress(module_handle, PCSTR(function_name_cstr.as_ptr() as *const u8));
         if local_function_address.is_none() {
             return Ok(None);
@@ -258,17 +272,18 @@ fn print_prologue_bytes(prologue: Vec<u8>) {
 }
 
 unsafe fn inline(process: &str, module: &str, function: &str){
+
     let pid_result = get_pid(&process).unwrap();
+    let process_handle = get_process_handle(pid_result).unwrap();
+    let module_handle = get_module_handle(module).unwrap();
 
-    let handle = get_handle(pid_result).unwrap();
+    check_process_handle(process_handle).unwrap();
 
-    let dirty_function_address = get_dirty_function_address(handle, &module, &function, pid_result).unwrap().unwrap();
+    let dirty_function_address = get_dirty_function_address(process_handle, &module, &function, pid_result).unwrap().unwrap();
 
-    let data = read_process_memory(handle, dirty_function_address, COMPARE_LENGTH);
-
+    let data = read_process_memory(process_handle, dirty_function_address, COMPARE_LENGTH);
     print_prologue_bytes(data);
-
-    check_process_handle(handle).unwrap();
+    
 }
 
 
