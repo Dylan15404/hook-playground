@@ -102,7 +102,7 @@ fn get_process_handle(process_id: u32) -> Result<HANDLE> {
     }
 }
 
-unsafe fn get_module_handle(module_name: &str) -> std::result::Result<HMODULE, Error> {
+unsafe fn get_generic_module_handle(module_name: &str) -> std::result::Result<HMODULE, Error> {
     let module_name_cstr = CString::new(module_name).unwrap();
     let module_handle_result = GetModuleHandleA(PCSTR(module_name_cstr.as_ptr() as *const u8));
     if !module_handle_result.is_ok() {
@@ -131,17 +131,18 @@ fn check_process_handle(handle: HANDLE) -> Result<()> {
 }
 
 // function to retrieve a module base address in the dirty process
-fn get_remote_module_base( module_name: &str, pid: u32) -> Result<Option<usize>> {
+fn get_remote_module_handle(module_name: &str, pid: u32) -> Result<Option<HMODULE>> {
     unsafe {
         // Create a snapshot of the modules in the process
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
         if snapshot == INVALID_HANDLE_VALUE {
             return Err(Error::from_win32());
         }
+
         println!("Creating snapshot for PID: {}", pid);
         println!("Snapshot handle: {:?}", snapshot);
 
-        // Initialise the module entry
+        // Initialize the module entry structure
         let mut module_entry = MODULEENTRY32 {
             dwSize: size_of::<MODULEENTRY32>() as u32,
             ..Default::default()
@@ -153,18 +154,20 @@ fn get_remote_module_base( module_name: &str, pid: u32) -> Result<Option<usize>>
             loop {
                 let module_name_current = CStr::from_ptr(module_entry.szModule.as_ptr());
                 if let Ok(name) = module_name_current.to_str() {
-                    println!("Found module: {} at base address: {:#x}", name, module_entry.modBaseAddr as usize);
+                    println!("Found module: {} at base address: {:#x}, handle: {:?}", name, module_entry.modBaseAddr as usize, module_entry.hModule);
                 } else {
                     println!("Failed to convert module name to string.");
                 }
+
+                // Check if the current module matches the target module name
                 if let Ok(name) = module_name_current.to_str() {
                     if name.eq_ignore_ascii_case(module_name) {
-                        // Module found, return its base address
-
-                        println!("Module found: {} at base address: {:#x}", name, module_entry.modBaseAddr as usize);
-                        return Ok(Some(module_entry.modBaseAddr as usize));
+                        // Module found, return its handle
+                        println!("Module found: {} with handle: {:?}", name, module_entry.hModule);
+                        return Ok(Some(module_entry.hModule)); // Return the module handle as usize
                     }
                 }
+
                 // Move to the next module in the snapshot
                 if Module32Next(snapshot, &mut module_entry).is_err() {
                     break;
@@ -208,12 +211,12 @@ fn check_function_in_module(function_address: usize, module_info: MODULEINFO)->b
 // function to get the address of a given function from a dirty process
 fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, function_name: &str, pid: u32) -> std::result::Result<Option<usize>, Error> {
     unsafe {
-        // Step 1 : get the base address of the module in the target process
-        let remote_module_base = get_remote_module_base(module_name, pid)?.unwrap();
-
 
         // unwrap the module handle from the result
-        let module_handle = get_module_handle(module_name)?;
+        let module_handle = match get_remote_module_handle(module_name, pid)? {
+            Some(handle) => handle,
+            None => return Err(Error::from_win32()), // or similar error
+        };
 
         // get the function name as a c string for PCSTR
         let function_name_cstr = CString::new(function_name).unwrap();
@@ -228,11 +231,13 @@ fn get_dirty_function_address(process_handle: HANDLE, module_name: &str, functio
         // Step 2: Get the module information from the target process
         let module_info: MODULEINFO = get_module_info(module_handle, process_handle)?;
 
+        let local_module_base = module_info.lpBaseOfDll as usize;
+
         // Step 2: Calculate the offset of the function in the local process
-        let function_offset = local_function_address.unwrap() as usize - module_info.lpBaseOfDll as usize;
+        let function_offset = local_function_address.unwrap() as usize - local_module_base;
 
         // Step 3: Calculate the absolute address of the function in the remote process
-        let remote_function_address = remote_module_base + function_offset;
+        let remote_function_address = local_module_base + function_offset;
 
         Ok(Some(remote_function_address))  // Return the calculated absolute address
     }
@@ -275,7 +280,6 @@ unsafe fn inline(process: &str, module: &str, function: &str){
 
     let pid_result = get_pid(&process).unwrap();
     let process_handle = get_process_handle(pid_result).unwrap();
-    let module_handle = get_module_handle(module).unwrap();
 
     check_process_handle(process_handle).unwrap();
 
@@ -283,7 +287,7 @@ unsafe fn inline(process: &str, module: &str, function: &str){
 
     let data = read_process_memory(process_handle, dirty_function_address, COMPARE_LENGTH);
     print_prologue_bytes(data);
-    
+
 }
 
 
