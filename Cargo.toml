@@ -13,4 +13,7 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_ProcessStatus"]
+    "Win32_System_ProcessStatus",
+    "Win32_System_Kernel",
+    "Wdk_System_Threading"
+]
