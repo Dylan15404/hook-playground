@@ -1,5 +1,6 @@
 use std::ffi::{c_void, CStr, CString};
 use std::ptr;
+use std::ptr::null_mut;
 use windows::{
     core::*,
     Win32::{
@@ -22,11 +23,13 @@ use windows::{
                 PROCESS_VM_READ,
                 GetExitCodeProcess,
                 PROCESS_ACCESS_RIGHTS,
-                PROCESS_BASIC_INFORMATION
+                PROCESS_BASIC_INFORMATION,
+                GetCurrentProcess
             },
             Diagnostics::Debug::{
                 sfMax,
-                ReadProcessMemory
+                ReadProcessMemory,
+                IMAGE_SECTION_HEADER
             },
             LibraryLoader::{
                 LoadLibraryExA,
@@ -36,7 +39,11 @@ use windows::{
             },
             ProcessStatus::{
                 MODULEINFO,
-                GetModuleInformation
+                GetModuleInformation,
+                GetMappedFileNameA
+            },
+            LibraryLoader::{
+                LoadLibraryA
             },
 
         },
@@ -49,9 +56,6 @@ use windows::{
         },
     }
 };
-use windows::Win32::System::LibraryLoader::LoadLibraryA;
-use windows::Win32::System::ProcessStatus::GetMappedFileNameA;
-use windows::Win32::System::Threading::GetCurrentProcess;
 
 
 #[repr(C)]
@@ -337,45 +341,107 @@ unsafe fn get_module_info(module_handle: HMODULE, process_handle: HANDLE) -> std
     }
 }
 
+
 // function to get the address of a given function from a dirty process
-fn get_function_address(process_handle: HANDLE, module_name: &str, function_name: &str, pid: u32) -> std::result::Result<Option<usize>, Error> {
+fn get_function_address(process_handle: HANDLE, module_name: &str, function_name: &str, pid: u32) -> Result<Option<*mut u8>> {
     unsafe {
+        // STEP 1: GET FUNCTION OFFSET
 
-        //STEP 1: GET FUNCTION OFFSET
-
-        // unwrap the module handle from the result
+        // Unwrap the module handle from the result
         let module_handle = match get_running_module_handle(module_name, pid)? {
             Some(handle) => handle,
-            None => return Err(Error::from_win32()), // or similar error
+            None => {
+                eprintln!("Failed to get module handle for {}", module_name);
+                return Err(Error::from_win32());
+            }
         };
 
-        // get the function name as a c string for PCSTR
-        let function_name_cstr = CString::new(function_name).unwrap();
-
-
-        // get the offset local address of the function
-        let local_function_address = GetProcAddress(module_handle, PCSTR(function_name_cstr.as_ptr() as *const u8));
-        if local_function_address.is_none() {
-            return Ok(None);
+        // Get the export directory of the module
+        let dos_header: *const IMAGE_DOS_HEADER = module_handle.0 as _;
+        if dos_header.is_null() {
+            eprintln!("Invalid DOS header");
+            return Err(Error::from_win32());
         }
 
-        let static_module_info = get_module_info(module_handle, process_handle)?;
-        let static_module_base = static_module_info.lpBaseOfDll as usize;
+        let nt_headers = ((module_handle.0 as usize) + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+        if nt_headers.is_null() {
+            eprintln!("Invalid NT headers");
+            return Err(Error::from_win32());
+        }
 
-        let function_offset = local_function_address.unwrap() as usize - static_module_base;
+        let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory[0].VirtualAddress;
+        if export_dir_rva == 0 {
+            eprintln!("No export directory found");
+            return Err(Error::from_win32());
+        }
 
-        //STEP 2: GET MODULE BASE ADDRESS
+        // Calculate the virtual address of the export directory
+        let export_dir_va = (module_handle.0 as usize + export_dir_rva as usize) as *const IMAGE_EXPORT_DIRECTORY;
 
-        let module_base_address = get_module_base_address(module_name, pid)?.unwrap();
+        if export_dir_va.is_null() {
+            eprintln!("Failed to calculate export directory address");
+            return Err(Error::from_win32());
+        }
 
-        //STEP 3: CALCULATE
+        // Validate the AddressOfNames and NumberOfNames fields
+        let name_rva_ptr = (*export_dir_va).AddressOfNames as *const u32;
+        let number_of_names = (*export_dir_va).NumberOfNames;
 
-        let remote_function_address = module_base_address + function_offset;
+        if name_rva_ptr.is_null() || number_of_names == 0 {
+            eprintln!("No function names found");
+            return Err(Error::from_win32());
+        }
 
-        Ok(Some(remote_function_address))  // Return the calculated absolute address
+        // Ensure that the index `i` is within bounds
+        for i in 0..number_of_names as usize {
+            // Check if `name_rva_ptr` is valid and within bounds
+            let name_rva = if let Some(valid_name_rva) = name_rva_ptr.add(i).as_ref() {
+                *valid_name_rva
+            } else {
+                eprintln!("Out of bounds access: name_rva_ptr.add({}) is invalid", i);
+                continue;  // Skip this iteration
+            };
+
+            // Validate the RVA before proceeding
+            if name_rva == 0 {
+                continue;
+            }
+
+            // Calculate the virtual address of the function name string
+            let name_va = (module_handle.0 as usize + name_rva as usize) as *const i8;
+
+            if name_va.is_null() {
+                continue;
+            }
+
+            // Safely read the name string
+            let name = match CStr::from_ptr(name_va).to_str() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            if name == function_name {
+                // Get the function's RVA (Relative Virtual Address)
+                let func_index = *((*export_dir_va).AddressOfNameOrdinals as *const u16).add(i) as usize;
+                let function_rva = *((*export_dir_va).AddressOfFunctions as *const u32).add(func_index);
+
+                if function_rva == 0 {
+                    eprintln!("Function RVA is zero");
+                    return Err(Error::from_win32());
+                }
+
+                // Calculate the function's virtual address
+                let function_va = (module_handle.0 as usize + function_rva as usize) as *mut u8;
+
+                return Ok(Some(function_va));
+            }
+        }
     }
-}
 
+    // If no matching function name is found
+    eprintln!("Function {} not found in module {}", function_name, module_name);
+    Err(Error::from_win32())
+}
 
 unsafe fn read_process_memory(process_handle: HANDLE, address: usize, size: usize) -> Vec<u8> {
     let mut buffer = vec![0u8; size];
@@ -433,15 +499,17 @@ fn hook_detected(){
 }
 
 unsafe fn detect_inline_disk(module: &str){
+    // Get the base address of the specified module using a static handle
     let library_base = get_static_module_handle(module).unwrap().unwrap();
     println!("Successfully loaded library: {}", module);
 
+    // Check if the library base address is null
     if library_base.0 == ptr::null_mut() {
         eprintln!("Failed to load ntdll.dll, error: {:?}", Error::from_win32());
         return;
     }
 
-    // Parse DOS Header
+    // Parse DOS Header at the start of the module
     let dos_header: *const IMAGE_DOS_HEADER = library_base.0 as _;
     let nt_headers: *const IMAGE_NT_HEADERS64 = (library_base.0 as usize + (*dos_header).e_lfanew as usize) as _;
     println!("Successfully parsed DOS header and NT headers.");
@@ -507,58 +575,150 @@ unsafe fn detect_inline_disk(module: &str){
     println!("Detection complete.");
 }
 
-fn detect_inline_process(target_process: &str, target_module: &str, target_function: &str) -> Result<()> {
+// extern "C" {
+//     fn ImageFirstSection(nt_header: *const IMAGE_NT_HEADERS64) -> *const IMAGE_SECTION_HEADER;
+// }
+
+unsafe fn detect_inline_process_all(target_process: &str, target_module: &str, target_function: &str) -> Result<()> {
 
     let pid = get_pid(target_process)?;
 
-    // Step 1: Open the process
-    let process_handle = get_process_handle(pid)?;
 
-    // Step 2: Get module handle and function address
-    let module_handle = get_running_module_handle(target_module, pid)?.unwrap();
+    // 1. Get the base address of the module
+    let module_handle = get_running_module_handle(target_module, pid).unwrap().unwrap();
+
+    // 2. Parse the PE headers
+    let dos_header: *const IMAGE_DOS_HEADER = module_handle.0 as _;
+    let nt_headers: *const IMAGE_NT_HEADERS64 = (module_handle.0 as usize + (*dos_header).e_lfanew as usize) as _;
+
+    // 3. Locate the section table and `.text` section
+    //let mut section: *const IMAGE_SECTION_HEADER = ImageFirstSection(nt_headers);
+
+    let section_table_start =
+        (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+
+    // Number of sections
+    let num_sections = (*nt_headers).FileHeader.NumberOfSections as usize;
+
+    let mut section = section_table_start;
 
 
-    let target_function_cstr = CString::new(target_function).unwrap();
 
-
-    // Get the address of the target function from the loaded module
-    let func_address = unsafe { GetProcAddress(module_handle, PCSTR(target_function_cstr.as_ptr() as *const u8)) };
-    if func_address.is_none() {
-        return Err(Error::from_win32());
-    }
-
-    // Step 3: Read memory of the target process
-    const BUF_SIZE: usize = 512;
-    let mut bytes: Vec<u8> = vec![0; BUF_SIZE];
-    let mut bytes_read = 0;
-
-    let read_result = unsafe { ReadProcessMemory(process_handle, func_address.unwrap() as *const c_void, bytes.as_mut_ptr() as _, BUF_SIZE, Some(&mut bytes_read)) };
-    if read_result.is_err() {
-        return Err(Error::from_win32());
-    }
-
-    // Step 4: Check the function bytes for possible hook patterns
-    for i in 0..bytes.len() - 1 {
-        if bytes[i] == 0x48 || bytes[i] == 0xFF {
-            if bytes[i + 1] == 0xB8 || bytes[i + 1] == 0xE0 {
-                // Potential hook detected
-                hook_detected();
-                return Ok(());
-            }
+    for _ in 0..(*nt_headers).FileHeader.NumberOfSections as usize {
+        if section.is_null() {
+            break;
         }
+
+        let section_name = CStr::from_ptr((*section).Name.as_ptr() as *const i8)
+            .to_str()
+            .unwrap_or("");
+
+        if section_name == ".text" {
+            let text_start = module_handle.0.add((*section).VirtualAddress as usize);
+            let text_size = (*section).SizeOfRawData as usize;
+
+            println!("{:?} {}", text_start, text_size);
+            break;
+        }
+
+        section = section.add(1);
     }
+
+
+
 
     // No hook detected
     println!("Failed to detect inline hook.");
     Ok(())
 }
 
+unsafe fn detect_inline_process(target_process: &str, target_module: &str, target_function: &str) -> Result<()> {
+
+    let pid = get_pid(target_process)?;
+
+    // 2. Open a handle to the target process
+    let process_handle = OpenProcess(
+        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+        false,
+        pid,
+    )?;
+    if process_handle.is_invalid() {
+        return Err(Error::from_win32());
+    }
+
+    // Ensure the handle is closed properly
+    //defer!(CloseHandle(process_handle));
+
+    // 1. Get the base address of the module
+    let module_handle = get_running_module_handle(target_module, pid).unwrap().unwrap();
+
+    // 4. Resolve the address of the target function
+    let func_address = get_function_address(process_handle, target_module, target_function, pid)?.unwrap();
+
+    // 2. Parse the PE headers
+    let dos_header: *const IMAGE_DOS_HEADER = module_handle.0 as _;
+    let nt_headers: *const IMAGE_NT_HEADERS64 = (module_handle.0 as usize + (*dos_header).e_lfanew as usize) as _;
+
+
+
+    // 6. Locate the `.text` section
+    //let mut section: *const IMAGE_SECTION_HEADER = ImageFirstSection(nt_headers);
+
+    let section_table_start =
+        (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+
+    let num_sections = (*nt_headers).FileHeader.NumberOfSections as usize;
+    let mut section = section_table_start;
+
+
+
+    for _ in 0..(*nt_headers).FileHeader.NumberOfSections as usize {
+        if section.is_null() {
+            break;
+        }
+
+        let section_name = CStr::from_ptr((*section).Name.as_ptr() as *const i8)
+            .to_str()
+            .unwrap_or("");
+
+        if section_name == ".text" {
+            let text_start = module_handle.0.add((*section).VirtualAddress as usize);
+            let text_size = (*section).SizeOfRawData as usize;
+
+            // 7. Check if the function address is within the `.text` section
+            if func_address as usize >= text_start as usize
+                && ((func_address as usize) < (text_start as usize + text_size))
+            {
+                // Calculate offset within `.text` and read contents
+                let func_offset = func_address as usize - text_start as usize;
+                let func_bytes = std::slice::from_raw_parts(
+                    text_start.add(func_offset) as *const u8,
+                    text_size - func_offset,
+                );
+
+                println!("Function bytes: {:x?}", &func_bytes[..std::cmp::min(32, func_bytes.len())]);
+            } else {
+                println!("Function is outside the .text section");
+            }
+            break;
+        }
+
+        section = section.add(1);
+    }
+
+    Ok(())
+}
+
 
 fn main() {
 
+    // println!("cargo:rustc-link-lib=imagehlp");
+    // println!("cargo:rustc-link-lib=dbghelp");
+    // println!("cargo:rustc-link-search=native=C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\ImageHlp.Lib");
+
     unsafe {
         //detect_inline_disk()
-        detect_inline_process("msedge.exe", "kernel32.dll", "CopyFileW");
+        detect_inline_process("msedge.exe", "kernel32.dll", "CopyFileW").expect("TODO: panic message");
         //detect_inline_disk("kernel32.dll");
     }
 }
