@@ -362,6 +362,7 @@ fn hook_detected(){
     // );
 }
 
+// Function to handle checking for detours in the functions array
 unsafe fn detect_detour(module: &str, pid: u32, functions: &[&str]){
     // Get the base address of the specified running module
     let library_base = get_running_module_handle(module, pid).unwrap().unwrap();
@@ -396,47 +397,58 @@ unsafe fn detect_detour(module: &str, pid: u32, functions: &[&str]){
     let num_names = (*export_dir).NumberOfNames;
     println!("Found {} exported functions.", num_names);
 
-    for i in 0..num_names {
-        let name_rva = *address_of_names.offset(i as isize);
-        let name_va = (library_base.0 as usize + name_rva as usize) as *const i8;
-        let function_name = CStr::from_ptr(name_va).to_str().unwrap();
+    for function_name in functions {
+        // Access the function by name in the export directory
+        let mut function_found = false;
+        for i in 0..num_names {
+            let name_rva = *address_of_names.offset(i as isize);
+            let name_va = (library_base.0 as usize + name_rva as usize) as *const i8;
+            let export_function_name = CStr::from_ptr(name_va).to_str().unwrap();
 
-        // Filter Nt|Zw functions
-        if function_name.starts_with("Nt") || function_name.starts_with("Zw") {
-            let ordinal_index = *address_of_name_ordinals.offset(i as isize);
-            let function_rva = *address_of_functions.offset(ordinal_index as isize);
-            let function_address = (library_base.0 as usize + function_rva as usize) as *const u8;
+            if export_function_name == *function_name {
+                function_found = true;
+                let ordinal_index = *address_of_name_ordinals.offset(i as isize);
+                let function_rva = *address_of_functions.offset(ordinal_index as isize);
+                let function_address = (library_base.0 as usize + function_rva as usize) as *const u8;
 
-            // Check syscall prologue
-            let syscall_prologue: [u8; 4] = [0x4C, 0x8B, 0xD1, 0xB8];
-            if std::slice::from_raw_parts(function_address, 4) != syscall_prologue {
-                // Check for JMP instruction
-                if *function_address == 0xE9 {
-                    // Read the relative jump offset manually (4 bytes)
-                    let relative_offset = *(function_address.offset(1) as *const u32) as isize;
-                    let jump_target = function_address.offset(5).offset(relative_offset) as *const u8;
+                // Check syscall prologue
+                let syscall_prologue: [u8; 4] = [0x4C, 0x8B, 0xD1, 0xB8];
+                if std::slice::from_raw_parts(function_address, 4) != syscall_prologue {
+                    // Check for JMP instruction
+                    if *function_address == 0xE9 {
+                        // Read the relative jump offset manually (4 bytes)
+                        let relative_offset = *(function_address.offset(1) as *const u32) as isize;
+                        let jump_target = function_address.offset(5).offset(relative_offset) as *const u8;
 
-                    // Convert `module_name` into a mutable slice correctly
-                    let mut module_name = vec![0u8; 512];
-                    let module_name_slice = &mut module_name[..];
-                    GetMappedFileNameA(
-                        GetCurrentProcess(),
-                        jump_target as _,
-                        module_name_slice,
-                    );
-                    let module_name = CStr::from_ptr(module_name_slice.as_ptr() as _).to_string_lossy();
+                        // Convert `module_name` into a mutable slice correctly
+                        let mut module_name = vec![0u8; 512];
+                        let module_name_slice = &mut module_name[..];
+                        GetMappedFileNameA(
+                            GetCurrentProcess(),
+                            jump_target as _,
+                            module_name_slice,
+                        );
+                        let module_name = CStr::from_ptr(module_name_slice.as_ptr() as _).to_string_lossy();
 
-                    println!(
-                        "Hooked: {} : {:?} into module {}",
-                        function_name, function_address, module_name
-                    );
-                } else {
-                    println!("Potentially hooked: {} : {:?}", function_name, function_address);
+                        println!(
+                            "Hooked: {} : {:?} into module {}",
+                            export_function_name, function_address, module_name
+                        );
+                    } else {
+                        println!("Potentially hooked: {} : {:?}", export_function_name, function_address);
+                        println!("Checking function: {}", export_function_name);
+                        println!("Function address: {:?}", function_address);
+                        let function_bytes = std::slice::from_raw_parts(function_address, 4);
+                        println!("First 4 bytes: {:?}", function_bytes);
+                    }
                 }
             }
         }
+
+        if !function_found {
+            println!("Function {} not found in the export directory.", function_name);
+        }
     }
-    println!("Detection complete.");
 }
 
 // extern "C" {
@@ -582,7 +594,7 @@ fn main() {
         //detect_inline_disk()
         //detect_inline_process("msedge.exe", "kernel32.dll", "CopyFileW").expect("TODO: panic message");
         //detect_inline_disk("kernel32.dll");
-        let functions = ["hello"];
+        let functions = ["CopyFileW"];
         detect_detour("kernel32.dll", pid, &functions);
     }
 }
