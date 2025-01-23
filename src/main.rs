@@ -253,56 +253,18 @@ unsafe fn get_module_info(module_handle: HMODULE, process_handle: HANDLE) -> Res
 
 
 // function to get the address of a given function from a dirty process
+
 unsafe fn get_function_address(module_handle: HMODULE, target_function: &str) -> Result<usize> {
-    // Get pointers to DOS and NT headers
-    let dos_header = module_handle.0 as *const IMAGE_DOS_HEADER;
-    let nt_headers = unsafe {
-        (module_handle.0 as *const u8).offset((*dos_header).e_lfanew as isize) as *const IMAGE_NT_HEADERS64
-    };
-
-    // Access the Export Directory
-    let export_directory = unsafe {
-        (module_handle.0 as *const u8).offset((*nt_headers).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT.0 as usize].VirtualAddress as isize) as *const IMAGE_EXPORT_DIRECTORY
-    };
-
-    if export_directory.is_null() {
-        return Err(Error::from_win32());  // Or another suitable error handling
-    }
-
-    // Get pointers to function addresses, names, and ordinals
-    let function_addresses = unsafe { (module_handle.0 as *const u32).offset((*export_directory).AddressOfFunctions as isize) };
-    let function_names = unsafe { (module_handle.0 as *const u32).offset((*export_directory).AddressOfNames as isize) };
-    let function_name_ordinals = unsafe { (module_handle.0 as *const u16).offset((*export_directory).AddressOfNameOrdinals as isize) };
-
-    if export_directory.is_null() {
-        return Err(Error::from_win32());
-    }
-
-
-    let number_of_names = unsafe { (*export_directory).NumberOfNames };
-    if number_of_names == 0 {
-        return Err(Error::from_win32());
-    }
-
-
-    // Look for the function by name
-    for i in 0..number_of_names as isize {
-        println!("Number of names: {}", number_of_names);
-        println!("Function names pointer: {:p}", function_names);
-        let name_offset = *function_names.offset(i as isize);
-        let name_ptr = (module_handle.0 as *const i8).offset(name_offset as isize);
-        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr) };
-
-        if name.to_str().unwrap() == target_function {
-            let ordinal = unsafe { *function_name_ordinals.offset(i as isize) };
-            let function_rva = unsafe { *function_addresses.offset(ordinal as isize) };
-            //return unsafe { (module_handle.0 as *const u8).offset(function_rva as isize) as *const () };
-            return Ok(function_rva as usize);
+    let func_name: PCSTR = PCSTR::from_raw(target_function.as_ptr());
+    match GetProcAddress(module_handle, func_name) {
+        Some(addr) => Ok(addr as usize),
+        None => {
+            let err = Error::from_win32();
+            println!("Failed to find function '{}' in module: {:?}", target_function, module_handle);
+            println!("Error details: {:?}", err);
+            Err(err)
         }
     }
-
-    // If function not found, return null
-    return Err(Error::from_win32());
 }
 
 unsafe fn read_process_memory(process_handle: HANDLE, address: usize, size: usize) -> Vec<u8> {
@@ -590,11 +552,10 @@ fn main() {
 
     unsafe {
 
-        let pid = get_pid("msedge.exe").unwrap();
-        //detect_inline_disk()
-        //detect_inline_process("msedge.exe", "kernel32.dll", "CopyFileW").expect("TODO: panic message");
-        //detect_inline_disk("kernel32.dll");
-        let functions = ["CopyFileW"];
-        detect_detour("kernel32.dll", pid, &functions);
+        detect_inline_process("msedge.exe", "kernel32.dll", "CopyFileW").expect("panic message");
+
+        //let pid = get_pid("msedge.exe").unwrap();
+        //let functions = ["CopyFileW"];
+        //detect_detour("kernel32.dll", pid, &functions);
     }
 }
