@@ -1,4 +1,5 @@
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_void, CStr, CString, OsString};
+use std::os::windows::ffi::OsStringExt;
 use std::ptr;
 use std::ptr::null_mut;
 use windows::{
@@ -65,11 +66,14 @@ use windows::{
         },
     }
 };
-
+use windows::Win32::System::Diagnostics::ToolHelp::{Module32FirstW, Module32NextW, MODULEENTRY32W};
+use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameW};
 
 const COMPARE_LENGTH: usize = 20;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
 const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
+const MAX_MODULE_NAME: usize = 256;
+
 
 // function to get the pid of a process with a given name
 fn get_pid(process_name: &str) -> std::result::Result<u32, Error> {
@@ -189,7 +193,7 @@ fn get_static_module_handle(module_name: &str) -> Result<Option<HMODULE>> {
 }
 
 
-fn get_module_base_address(module_name: &str, pid: u32) -> Result<Option<usize>> {
+fn get_module_base_address(target_module: &str, pid: u32) -> Result<usize> {
     unsafe {
         // Create a snapshot of the modules in the process
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
@@ -201,40 +205,42 @@ fn get_module_base_address(module_name: &str, pid: u32) -> Result<Option<usize>>
         println!("Snapshot handle: {:?}", snapshot);
 
         // Initialize the module entry structure
-        let mut module_entry = MODULEENTRY32 {
-            dwSize: size_of::<MODULEENTRY32>() as u32,
-            ..Default::default()
-        };
+        let mut module_entry: MODULEENTRY32W = std::mem::zeroed();
+        module_entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+
         println!("Module entry size: {}", size_of::<MODULEENTRY32>());
 
-        // Iterate through modules to find the target module
-        if Module32First(snapshot, &mut module_entry).is_ok() {
+        // Iterate modules
+        let mut found = false;
+        let mut base_addr = 0usize;
+
+        if Module32FirstW(snapshot, &mut module_entry).is_ok() {
             loop {
-                let module_name_current = CStr::from_ptr(module_entry.szModule.as_ptr());
-                if let Ok(name) = module_name_current.to_str() {
-                    println!("Found module: {} at base address: {:#x}, handle: {:?}", name, module_entry.modBaseAddr as usize, module_entry.hModule);
-                } else {
-                    println!("Failed to convert module name to string.");
+                // Extract module name
+                let name_wide = &module_entry.szModule;
+                let name_len = name_wide.iter().position(|&c| c == 0).unwrap_or(name_wide.len());
+                let name = OsString::from_wide(&name_wide[..name_len]).to_string_lossy().into_owned();
+
+                // Case-insensitive comparison
+                if name.eq_ignore_ascii_case(target_module) {
+                    base_addr = module_entry.modBaseAddr as usize;
+                    found = true;
+                    break;
                 }
 
-                // Check if the current module matches the target module name
-                if let Ok(name) = module_name_current.to_str() {
-                    if name.eq_ignore_ascii_case(module_name) {
-                        // Module found, return its base address
-                        println!("Module found: {} with base address: {:#x}", name, module_entry.modBaseAddr as usize);
-                        return Ok(Some(module_entry.modBaseAddr as usize)); // Return the base address as usize
-                    }
-                }
-
-                // Move to the next module in the snapshot
-                if Module32Next(snapshot, &mut module_entry).is_err() {
+                if Module32NextW(snapshot, &mut module_entry).is_err() {
                     break;
                 }
             }
+        } else {
+            return Err(Error::from_win32()); // Return error if failed
         }
 
-        // If the module wasn't found
-        Err(Error::from_win32())
+        if found {
+            Ok(base_addr)
+        } else {
+            return Err(Error::from_win32()) // Return error if failed
+        }
     }
 }
 
@@ -413,10 +419,6 @@ unsafe fn detect_detour(module: &str, pid: u32, functions: &[&str]){
     }
 }
 
-// extern "C" {
-//     fn ImageFirstSection(nt_header: *const IMAGE_NT_HEADERS64) -> *const IMAGE_SECTION_HEADER;
-// }
-
 unsafe fn detect_inline_process_all(target_process: &str, target_module: &str, target_function: &str) -> Result<()> {
 
     let pid = get_pid(target_process)?;
@@ -470,92 +472,53 @@ unsafe fn detect_inline_process_all(target_process: &str, target_module: &str, t
     Ok(())
 }
 
-unsafe fn detect_inline_process(target_process: &str, target_module: &str, target_function: &str) -> Result<()> {
+unsafe fn detect_inline_process(target_pid: u32, target_module: &str, target_function: &str) -> Result<Option<bool>> {
 
-    let pid = get_pid(target_process)?;
+    let process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, target_pid)?;
+    let target_base = get_module_base_address(target_module, target_pid)?;
 
-    // 2. Open a handle to the target process
-    let process_handle = OpenProcess(
-        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-        false,
-        pid,
+    // Get function information from current process
+    let local_module = GetModuleHandleA(PCSTR(target_module.as_ptr()))?;
+    println!("mwow");
+    let local_function = GetProcAddress(local_module, PCSTR::from_raw(target_function.as_ptr()));
+
+    // Calculate function offset
+    let module_base_local = local_module.0 as usize;
+    let function_offset = local_function.unwrap() as usize - module_base_local;
+
+    // Calculate target address
+    let target_function_address = target_base + function_offset;
+
+    // Read target process memory
+    let mut target_bytes = [0u8; 32];
+    let mut bytes_read = 0;
+    ReadProcessMemory(
+        process,
+        target_function_address as _,
+        target_bytes.as_mut_ptr() as _,
+        target_bytes.len(),
+        Some(&mut bytes_read),
     )?;
-    if process_handle.is_invalid() {
-        return Err(Error::from_win32());
-    }
 
-    // Ensure the handle is closed properly
-    //defer!(CloseHandle(process_handle));
+    CloseHandle(process)?;
+    print!("done");
 
-    // 1. Get the base address of the module
-    let module_handle = get_running_module_handle(target_module, pid).unwrap().unwrap();
-
-    // 4. Resolve the address of the target function
-    let func_address = get_function_address(module_handle, target_function)?;
-
-    // 2. Parse the PE headers
-    let dos_header: *const IMAGE_DOS_HEADER = module_handle.0 as _;
-    let nt_headers: *const IMAGE_NT_HEADERS64 = (module_handle.0 as usize + (*dos_header).e_lfanew as usize) as _;
-
-
-
-    // 6. Locate the `.text` section
-    //let mut section: *const IMAGE_SECTION_HEADER = ImageFirstSection(nt_headers);
-
-    let section_table_start =
-        (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
-
-    let num_sections = (*nt_headers).FileHeader.NumberOfSections as usize;
-    let mut section = section_table_start;
-
-
-
-    for _ in 0..(*nt_headers).FileHeader.NumberOfSections as usize {
-        if section.is_null() {
-            break;
-        }
-
-        let section_name = CStr::from_ptr((*section).Name.as_ptr() as *const i8)
-            .to_str()
-            .unwrap_or("");
-
-        if section_name == ".text" {
-            let text_start = module_handle.0.add((*section).VirtualAddress as usize);
-            let text_size = (*section).SizeOfRawData as usize;
-
-            // 7. Check if the function address is within the `.text` section
-            if func_address as usize >= text_start as usize
-                && ((func_address as usize) < (text_start as usize + text_size))
-            {
-                // Calculate offset within `.text` and read contents
-                let func_offset = func_address as usize - text_start as usize;
-                let func_bytes = std::slice::from_raw_parts(
-                    text_start.add(func_offset) as *const u8,
-                    text_size - func_offset,
-                );
-
-                println!("Function bytes: {:x?}", &func_bytes[..std::cmp::min(32, func_bytes.len())]);
-            } else {
-                println!("Function is outside the .text section");
-            }
-            break;
-        }
-
-        section = section.add(1);
-    }
-
-    Ok(())
+    // Compare function bytes
+    Ok(Option::from(target_bytes[0] == 0xE9 || target_bytes[0] == 0xE8))
 }
 
 
 fn main() {
 
     unsafe {
-
-        detect_inline_process("msedge.exe", "kernel32.dll", "CopyFileW").expect("panic message");
-
-        //let pid = get_pid("msedge.exe").unwrap();
+        let pid = get_pid("msedge.exe").unwrap();
         //let functions = ["CopyFileW"];
+        let function = "CopyFileW";
+
         //detect_detour("kernel32.dll", pid, &functions);
+
+        let target_module = "kernel32.dll";
+
+        detect_inline_process(pid, target_module, function);
     }
 }
