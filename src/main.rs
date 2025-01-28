@@ -15,7 +15,10 @@ use windows::{
                 Process32First,
                 Process32Next,
                 Module32First,
-                Module32Next
+                Module32Next,
+                Module32FirstW,
+                Module32NextW,
+                MODULEENTRY32W
             },
             Threading::{
                 OpenProcess,
@@ -46,7 +49,9 @@ use windows::{
             ProcessStatus::{
                 MODULEINFO,
                 GetModuleInformation,
-                GetMappedFileNameA
+                GetMappedFileNameA,
+                EnumProcessModules,
+                GetModuleBaseNameW
             },
             LibraryLoader::{
                 LoadLibraryA
@@ -54,6 +59,9 @@ use windows::{
             SystemServices::{
                 IMAGE_EXPORT_DIRECTORY,
                 IMAGE_DOS_HEADER
+            },
+            Memory::{
+                MEMORY_BASIC_INFORMATION
             },
 
         },
@@ -66,8 +74,7 @@ use windows::{
         },
     }
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{Module32FirstW, Module32NextW, MODULEENTRY32W};
-use windows::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleBaseNameW};
+use windows::Win32::System::Memory::VirtualQuery;
 
 const COMPARE_LENGTH: usize = 20;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
@@ -112,7 +119,7 @@ fn get_pid(process_name: &str) -> std::result::Result<u32, Error> {
 }
 
 // function to get the handle of a process with a given pid
-fn get_process_handle(process_id: u32) -> Result<HANDLE> {
+fn get_process_handle(process_id: u32, access:  PROCESS_ACCESS_RIGHTS) -> Result<HANDLE> {
     unsafe {
         let process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_ALL_ACCESS, false, process_id)?;
         if process_handle == INVALID_HANDLE_VALUE {
@@ -472,39 +479,76 @@ unsafe fn detect_inline_process_all(target_process: &str, target_module: &str, t
     Ok(())
 }
 
-unsafe fn detect_inline_process(target_pid: u32, target_module: &str, target_function: &str) -> Result<Option<bool>> {
+fn detect_inline_local(target_module: &str, target_function: &str) -> Result<Option<bool>> {
 
-    let process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, target_pid)?;
-    let target_base = get_module_base_address(target_module, target_pid)?;
+    // Common function prologues
+    const MSVC_PROLOGUE: [u8; 2] = [0x8B, 0xFF]; // MOV EDI, EDI
+    const GCC_PROLOGUE: [u8; 3] = [0x55, 0x48, 0x89]; // PUSH RBP, MOV RSP, RBP
 
-    // Get function information from current process
-    let local_module = GetModuleHandleA(PCSTR(target_module.as_ptr()))?;
-    println!("mwow");
-    let local_function = GetProcAddress(local_module, PCSTR::from_raw(target_function.as_ptr()));
 
-    // Calculate function offset
-    let module_base_local = local_module.0 as usize;
-    let function_offset = local_function.unwrap() as usize - module_base_local;
+    // Convert the module and function names to null-terminated C strings
+    let module_name_c = CString::new(target_module).expect("CString::new failed");
+    let module_name_pcstr: PCSTR = PCSTR(module_name_c.as_ptr() as *const u8);
+    let function_name_c = CString::new(target_function).expect("CString::new failed");
+    let function_name_pcstr: PCSTR = PCSTR(function_name_c.as_ptr() as *const u8);
 
-    // Calculate target address
-    let target_function_address = target_base + function_offset;
 
-    // Read target process memory
-    let mut target_bytes = [0u8; 32];
-    let mut bytes_read = 0;
-    ReadProcessMemory(
-        process,
-        target_function_address as _,
-        target_bytes.as_mut_ptr() as _,
-        target_bytes.len(),
-        Some(&mut bytes_read),
-    )?;
+    // Initialize result
+    let mut function_preamble_hooked = false;
 
-    CloseHandle(process)?;
-    print!("done");
+    unsafe {
+        // Fetch the module handle
+        println!("[~] Attempting to get module handle for {}", target_module);
+        let h_mod: HMODULE = GetModuleHandleA(module_name_pcstr)?;
+        if h_mod.is_invalid() {
+            eprintln!("[!] Couldn't fetch module: {}", target_module);
+            return Ok(Some(false));
+        }
+        println!("[✓] Module {} loaded at {:?}", target_module, h_mod);
 
-    // Compare function bytes
-    Ok(Option::from(target_bytes[0] == 0xE9 || target_bytes[0] == 0xE8))
+        // Fetch the function address
+        println!("[~] Looking up address for {}", target_function);
+        let address_function = GetProcAddress(h_mod, function_name_pcstr);
+        if address_function.is_none() {
+            eprintln!("[!] Couldn't find address for function: {}", target_function);
+            return Ok(Some(false));
+        }
+        println!("[✓] Function {} found at {:p}", target_function, address_function.unwrap());
+
+        // Try to read the first byte of the function address
+        let result = std::panic::catch_unwind(|| {
+            let address = address_function.unwrap() as *const u8;
+            
+
+            println!("[~] Reading first byte at {:p}", address);
+
+            let first_byte = unsafe { *address };
+            println!("[+] First byte: 0x{:x}", first_byte);
+
+            let is_hooked = matches!(first_byte, 0xE8 | 0xE9 | 0xEA | 0xEB);
+            if is_hooked {
+                println!("[!] Suspicious opcode detected: 0x{:x}", first_byte);
+            } else {
+                println!("[✓] Normal preamble byte detected: 0x{:x}", first_byte);
+            }
+            is_hooked
+        });
+
+        match result {
+            Ok(is_hooked) => {
+                function_preamble_hooked = is_hooked;
+                println!("[~] Hook detection result: {}", is_hooked);
+            },
+            Err(_) => {
+                eprintln!("Couldn't read bytes at function address: {}", target_function);
+                eprintln!("[!] Memory access violation while reading {}", target_function);
+
+                return Ok(Some(false));
+            }
+        }
+    }
+    println!("[+] Final detection result: {}", function_preamble_hooked);
+    Ok(Some(function_preamble_hooked))
 }
 
 
@@ -519,6 +563,6 @@ fn main() {
 
         let target_module = "kernel32.dll";
 
-        detect_inline_process(pid, target_module, function);
+        detect_inline_local(target_module, function);
     }
 }
