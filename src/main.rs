@@ -1,7 +1,9 @@
 use std::ffi::{c_void, CStr, CString, OsString};
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
-use std::ptr::null_mut;
+use std::ptr::{copy_nonoverlapping, null_mut};
+use capstone::arch::{BuildsCapstone, BuildsCapstoneSyntax};
+use capstone::{arch, Capstone, Insn};
 use windows::{
     core::*,
     Win32::{
@@ -80,6 +82,15 @@ const COMPARE_LENGTH: usize = 20;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
 const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
 const MAX_MODULE_NAME: usize = 256;
+
+const X64_JUMP_PATTERN: [u8; 14] = [
+    0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, // JMP [rip+0x0]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // Absolute address
+];
+
+// Common function prologues
+const MSVC_PROLOGUE: [u8; 2] = [0x8B, 0xFF]; // MOV EDI, EDI
+const GCC_PROLOGUE: [u8; 3] = [0x55, 0x48, 0x89]; // PUSH RBP, MOV RSP, RBP
 
 
 // function to get the pid of a process with a given name
@@ -310,6 +321,25 @@ fn print_prologue_bytes(prologue: Vec<u8>) {
         print!("{:02x} ", byte);
     }
     println!();
+    let cs = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Intel)
+        .detail(false)
+        .build().unwrap();
+
+    let insns = cs.disasm_all(&prologue, 0).unwrap();
+
+    println!("Disassembled instructions:");
+    for insn in insns.iter() {
+        println!(
+            "0x{:x}:\t{}\t{}",
+            insn.address(),
+            insn.mnemonic().unwrap_or(""),
+            insn.op_str().unwrap_or("")
+        );
+    }
+
 }
 
 // unsafe fn inline(process: &str, module: &str, function: &str){
@@ -481,9 +511,6 @@ unsafe fn detect_inline_process_all(target_process: &str, target_module: &str, t
 
 fn detect_inline_local(target_module: &str, target_function: &str) -> Result<Option<bool>> {
 
-    // Common function prologues
-    const MSVC_PROLOGUE: [u8; 2] = [0x8B, 0xFF]; // MOV EDI, EDI
-    const GCC_PROLOGUE: [u8; 3] = [0x55, 0x48, 0x89]; // PUSH RBP, MOV RSP, RBP
 
 
     // Convert the module and function names to null-terminated C strings
@@ -515,10 +542,38 @@ fn detect_inline_local(target_module: &str, target_function: &str) -> Result<Opt
         }
         println!("[✓] Function {} found at {:p}", target_function, address_function.unwrap());
 
-        // Try to read the first byte of the function address
+
+
+        // Try to read the first bytes of the function address
         let result = std::panic::catch_unwind(|| {
             let address = address_function.unwrap() as *const u8;
-            
+            println!("[~] Analyzing first 14 bytes at {:p}", address);
+
+            let mut buffer: [u8; 14] = [0; 14];
+            copy_nonoverlapping(address, buffer.as_mut_ptr(), buffer.len());
+
+            // Check for x64 absolute jump (FF 25 00 00 00 00 followed by address)
+            if buffer[0] == 0xFF && buffer[1] == 0x25 {
+                println!("[!] Detected x64 absolute jump hook");
+                return Ok::<bool, Error>(true);
+            }
+
+            // Check for short jumps (EB XX)
+            if buffer[0] == 0xEB && buffer[1] != 0x00 {
+                println!("[!] Detected short jump hook");
+                return Ok::<bool, Error>(true);
+            }
+
+            // Check for common hooking library patterns
+            if buffer.starts_with(&[0x60, 0xE8]) { // pushad + call
+                println!("[!] Detected pushad+call hook pattern");
+                return Ok::<bool, Error>(true);
+            }
+
+            if buffer.starts_with(&MSVC_PROLOGUE) || buffer.starts_with(&GCC_PROLOGUE) {
+                println!("[✓] Valid function prologue detected");
+                return Ok::<bool, Error>(false);
+            }
 
             println!("[~] Reading first byte at {:p}", address);
 
@@ -531,13 +586,13 @@ fn detect_inline_local(target_module: &str, target_function: &str) -> Result<Opt
             } else {
                 println!("[✓] Normal preamble byte detected: 0x{:x}", first_byte);
             }
-            is_hooked
+            Ok(is_hooked)
         });
 
         match result {
             Ok(is_hooked) => {
-                function_preamble_hooked = is_hooked;
-                println!("[~] Hook detection result: {}", is_hooked);
+                function_preamble_hooked = is_hooked?;
+                println!("[~] Hook detection result: {}", function_preamble_hooked);
             },
             Err(_) => {
                 eprintln!("Couldn't read bytes at function address: {}", target_function);
@@ -551,18 +606,52 @@ fn detect_inline_local(target_module: &str, target_function: &str) -> Result<Opt
     Ok(Some(function_preamble_hooked))
 }
 
+fn get_function_bytes(target_module: &str, target_function: &str, num_bytes: usize) -> windows::core::Result<Vec<u8>> {
+    // Convert the module and function names to null-terminated C strings.
+    let module_name_c = CString::new(target_module).expect("CString::new failed");
+    let module_name_pcstr = PCSTR(module_name_c.as_ptr() as *const u8);
+    let function_name_c = CString::new(target_function).expect("CString::new failed");
+    let function_name_pcstr = PCSTR(function_name_c.as_ptr() as *const u8);
+
+    unsafe {
+        // Fetch the module handle.
+        let h_mod: HMODULE = GetModuleHandleA(module_name_pcstr)?;
+        if h_mod.is_invalid() {
+            return Err(windows::core::Error::from_win32());
+        }
+
+        // Fetch the function address.
+        let address_function = GetProcAddress(h_mod, function_name_pcstr);
+        if address_function.is_none() {
+            return Err(windows::core::Error::from_win32());
+        }
+
+        let address = address_function.unwrap() as *const u8;
+
+        // Allocate a buffer to hold the requested bytes.
+        let mut buffer = vec![0u8; num_bytes];
+        copy_nonoverlapping(address, buffer.as_mut_ptr(), num_bytes);
+
+        Ok(buffer)
+    }
+}
+
 
 fn main() {
 
     unsafe {
         let pid = get_pid("msedge.exe").unwrap();
         //let functions = ["CopyFileW"];
-        let function = "CopyFileW";
+        let function = "CreateToolhelp32Snapshot";
 
         //detect_detour("kernel32.dll", pid, &functions);
 
         let target_module = "kernel32.dll";
 
-        detect_inline_local(target_module, function);
+        //detect_inline_local(target_module, function);
+
+        let bytes = get_function_bytes(target_module, function, 16).unwrap();
+        print_prologue_bytes(bytes);
+
     }
 }
