@@ -22,9 +22,6 @@ use windows::{
                 Process32Next,
                 Module32First,
                 Module32Next,
-                Module32FirstW,
-                Module32NextW,
-                MODULEENTRY32W
             },
             Threading::{
                 OpenProcess,
@@ -88,6 +85,7 @@ use windows::{
 };
 use windows::Win32::Foundation::{GetLastError, BOOL};
 use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPMODULE32;
+use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
 
 const COMPARE_LENGTH: usize = 20;
 const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
@@ -102,63 +100,6 @@ const X64_JUMP_PATTERN: [u8; 14] = [
 // Common function prologues
 const MSVC_PROLOGUE: [u8; 2] = [0x8B, 0xFF]; // MOV EDI, EDI
 const GCC_PROLOGUE: [u8; 3] = [0x55, 0x48, 0x89]; // PUSH RBP, MOV RSP, RBP
-
-
-
-
-
-
-
-fn get_module_base_address(target_module: &str, pid: u32) -> Result<usize> {
-    unsafe {
-        // Create a snapshot of the modules in the process
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(Error::from_win32());
-        }
-
-        println!("Creating snapshot for PID: {}", pid);
-        println!("Snapshot handle: {:?}", snapshot);
-
-        // Initialize the module entry structure
-        let mut module_entry: MODULEENTRY32W = std::mem::zeroed();
-        module_entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
-
-        println!("Module entry size: {}", size_of::<MODULEENTRY32>());
-
-        // Iterate modules
-        let mut found = false;
-        let mut base_addr = 0usize;
-
-        if Module32FirstW(snapshot, &mut module_entry).is_ok() {
-            loop {
-                // Extract module name
-                let name_wide = &module_entry.szModule;
-                let name_len = name_wide.iter().position(|&c| c == 0).unwrap_or(name_wide.len());
-                let name = OsString::from_wide(&name_wide[..name_len]).to_string_lossy().into_owned();
-
-                // Case-insensitive comparison
-                if name.eq_ignore_ascii_case(target_module) {
-                    base_addr = module_entry.modBaseAddr as usize;
-                    found = true;
-                    break;
-                }
-
-                if Module32NextW(snapshot, &mut module_entry).is_err() {
-                    break;
-                }
-            }
-        } else {
-            return Err(Error::from_win32()); // Return error if failed
-        }
-
-        if found {
-            Ok(base_addr)
-        } else {
-            return Err(Error::from_win32()) // Return error if failed
-        }
-    }
-}
 
 // function to get module information (base address, size, etc.)
 unsafe fn get_module_info(module_handle: HMODULE, process_handle: HANDLE) -> Result<MODULEINFO> {
@@ -518,9 +459,7 @@ fn get_function_bytes(target_module: &str, target_function: &str, num_bytes: usi
     }
 }
 
-struct ProcessModules {
-    modules: Vec<MODULEINFO>,
-}
+
 /*
 fn get_process_modules(process_handle: HANDLE) -> Option<ProcessModules> {
     let mut memory_info = MEMORY_BASIC_INFORMATION::default();
@@ -597,11 +536,13 @@ pub fn is_valid_process_handle(handle: HANDLE) -> bool {
     true // The function succeeded, meaning the handle is valid.
 }
 
+
+
+
 unsafe fn get_modules(pid: u32) -> Result<Vec<Vec<u8>>> {
     let process_handle = get_process_handle(pid)?;
-
     println!("handle valid: {}", is_valid_process_handle(process_handle));
-    // Get the base address of the main module
+
     // Create a snapshot of the modules in the process
     let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
 
@@ -610,13 +551,13 @@ unsafe fn get_modules(pid: u32) -> Result<Vec<Vec<u8>>> {
 
     // Initialize the module entry structure
     let mut modules = Vec::new();
-    let mut entry = MODULEENTRY32W {
-        dwSize: size_of::<MODULEENTRY32W>() as u32,
+    let mut entry = MODULEENTRY32 {
+        dwSize: size_of::<MODULEENTRY32>() as u32,
         ..Default::default()
     };
     println!("Module entry size: {}", size_of::<MODULEENTRY32>());
 
-    Module32FirstW(snapshot, &mut entry) ?;
+    Module32First(snapshot, &mut entry) ?;
 
     loop {
         // Capture module data
@@ -637,45 +578,28 @@ unsafe fn get_modules(pid: u32) -> Result<Vec<Vec<u8>>> {
                 Some(&mut bytes_read)
             );
         println!("bytes_read: {}", bytes_read);
-        if result.is_ok() && bytes_read == module_size {
+        if result.is_ok() {
+            buffer.truncate(bytes_read); // Adjust buffer to bytes actually read
             modules.push(buffer);
         } else {
             let err = unsafe { GetLastError() };
             eprintln!("Failed to read module at {base_address:p}: {}", Error::from(err));
         }
         // Move to next module
-        match unsafe { Module32NextW(snapshot, &mut entry) } {
+        match unsafe { Module32Next(snapshot, &mut entry) } {
             Ok(_) => continue,
             Err(_) => break,
         }
     }
-    CloseHandle(snapshot)?;
-    CloseHandle(process_handle)?;
+    if let Err(e) = CloseHandle(snapshot) {
+        eprintln!("Failed to close snapshot handle: {}", e);
+    }
+    if let Err(e) = CloseHandle(process_handle) {
+        eprintln!("Failed to close process handle: {}", e);
+    }
     println!("Loaded {} modules from memory", modules.len());
     Ok(modules)
-    //
-    // if Module32First(snapshot, &mut module_entry).is_ok() {
-    //     let base_address = module_entry.modBaseAddr as *mut _;
-    //     let image_size = module_entry.modBaseSize as usize;
-    //     println!(
-    //         "Module base address: {:?}, Image size: {}",
-    //         base_address, image_size
-    //     );
-    //     // Allocate buffer
-    //     let mut buffer = vec![0u8; image_size];
-    //
-    //     // Read process memory
-    //     let mut bytes_read = 0;
-    //     if ReadProcessMemory(process_handle, base_address, buffer.as_mut_ptr() as _, image_size, Some(&mut bytes_read)).is_ok() {
-    //         CloseHandle(process_handle);
-    //         CloseHandle(snapshot);
-    //         return Ok(buffer);
-    //     }
-    //
-    // }
-    // CloseHandle(process_handle);
-    // CloseHandle(snapshot);
-    // return Err(Error::from_win32());
+
 }
 
 
