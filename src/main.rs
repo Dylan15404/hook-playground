@@ -1,5 +1,8 @@
 mod utils;
+mod Modules;
+mod Module;
 
+use Modules::*;
 use utils::{get_pid, get_process_handle, get_running_module_handle, get_static_module_handle};
 use std::ffi::{c_void, CStr, CString, OsString};
 use std::os::windows::ffi::OsStringExt;
@@ -84,6 +87,7 @@ use windows::{
     }
 };
 use windows::Win32::Foundation::{GetLastError, BOOL};
+use windows::Win32::System::Diagnostics::Debug::PSYMBOLSERVERGETINDEXSTRINGW;
 use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPMODULE32;
 use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
 
@@ -545,7 +549,6 @@ unsafe fn get_modules(pid: u32) -> Result<Vec<Vec<u8>>> {
 
     // Create a snapshot of the modules in the process
     let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
-
     println!("Creating snapshot for PID: {}", pid);
     println!("Snapshot handle: {:?}", snapshot);
 
@@ -563,6 +566,8 @@ unsafe fn get_modules(pid: u32) -> Result<Vec<Vec<u8>>> {
         // Capture module data
         let base_address = entry.modBaseAddr;
         let module_size = entry.modBaseSize as usize;
+        let path = entry.szExePath;
+
 
         // Allocate buffer for module data
         let mut buffer = vec![0u8; module_size];
@@ -636,8 +641,10 @@ fn main() {
     unsafe {
         let pid = get_pid("msedge.exe").unwrap();
 
-        let header = get_modules(pid).expect("get_modules failed");
+        //let header = get_modules(pid).expect("get_modules failed");
         //attempt(header);
+        let mut modules = Modules::modules::new();
+        modules.load_modules(pid);
 
 /*
 
