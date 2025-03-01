@@ -92,8 +92,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPMODULE32;
 use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
 
 const COMPARE_LENGTH: usize = 20;
-const LOAD_LIBRARY_AS_DATAFILE: u32 = 0x00000002;
-const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u32 = 0x00000020;
+const LOAD_LIBRARY_AS_DATAFILE: u64 = 0x00000002;
+const LOAD_LIBRARY_AS_IMAGE_RESOURCE: u64 = 0x00000020;
 const MAX_MODULE_NAME: usize = 256;
 
 const X64_JUMP_PATTERN: [u8; 14] = [
@@ -218,9 +218,9 @@ unsafe fn detect_detour(module: &str, pid: u32, functions: &[&str]){
 
     // Access Export Table Arrays
     let address_of_functions =
-        (library_base.0 as usize + (*export_dir).AddressOfFunctions as usize) as *const u32;
+        (library_base.0 as usize + (*export_dir).AddressOfFunctions as usize) as *const u64;
     let address_of_names =
-        (library_base.0 as usize + (*export_dir).AddressOfNames as usize) as *const u32;
+        (library_base.0 as usize + (*export_dir).AddressOfNames as usize) as *const u64;
     let address_of_name_ordinals =
         (library_base.0 as usize + (*export_dir).AddressOfNameOrdinals as usize) as *const u16;
     println!("Successfully accessed export table arrays.");
@@ -249,7 +249,7 @@ unsafe fn detect_detour(module: &str, pid: u32, functions: &[&str]){
                     // Check for JMP instruction
                     if *function_address == 0xE9 {
                         // Read the relative jump offset manually (4 bytes)
-                        let relative_offset = *(function_address.offset(1) as *const u32) as isize;
+                        let relative_offset = *(function_address.offset(1) as *const u64) as isize;
                         let jump_target = function_address.offset(5).offset(relative_offset) as *const u8;
 
                         // Convert `module_name` into a mutable slice correctly
@@ -639,14 +639,23 @@ fn attempt(buffer: Vec<u8>) {
 fn main() {
 
     unsafe {
-        let pid = get_pid("msedge.exe").unwrap();
+        let pid = get_pid("DiscordPTB.exe").unwrap();
 
         //let header = get_modules(pid).expect("get_modules failed");
         //attempt(header);
         let mut modules = Modules::modules::new();
         modules.load_modules(pid);
+        if let Some(buffer) = modules.modules[0].get_dirty_buffer() {
+            println!("Module loaded successfully");
+            println!("buffer: {:?}", buffer);
+            attempt(buffer.clone()); // Clone if attempt needs ownership
+        } else {
+            println!("No valid dirty buffer available");
+        }
 
-/*
+
+
+        /*
 
         let pid = get_pid("msedge.exe").unwrap();
         let process_handle = get_process_handle(pid).unwrap();

@@ -46,10 +46,10 @@ pub struct module {
     pub valid: Option<bool>,
 
     /// The size (in bytes) of the module loaded in the process memory.
-    pub virtual_base: u32,
+    pub virtual_base: u64,
 
     /// The size (in bytes) of the module as loaded.
-    pub virtual_size: u32,
+    pub virtual_size: u64,
 
     /// The data (Vec<u8> of bytes) of the module loaded from the dirty process' memory
     pub dirty_data: Option<Vec<u8>>,
@@ -63,7 +63,7 @@ pub struct module {
 }
 
 impl module {
-    pub fn new( virtual_base: u32, virtual_size: u32, index: u8, file_path: [i8; 260]) -> Self {
+    pub fn new( virtual_base: u64, virtual_size: u64, index: u8, file_path: [i8; 260]) -> Self {
         Self {
             index,
             name: None, // Wrap in Some since it's provided
@@ -75,6 +75,15 @@ impl module {
             file_path,
         }
     }
+
+    pub fn get_dirty_buffer(&self) -> Option<&Vec<u8>> {
+        if self.valid == Some(true) {
+            self.dirty_data.as_ref()
+        } else {
+            None
+        }
+    }
+
 
     pub fn check_IAT(&self) -> Result<()> {
         // Implement import table checking logic

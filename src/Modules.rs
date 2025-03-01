@@ -12,8 +12,8 @@ use crate::utils::get_process_handle;
 /// Holds a collection of module objects.
 pub struct modules {
     pub modules: Vec<Module::module>,
-    cumulative_module_sizes: Vec<u32>,
-    cumulative_module_size: u32,
+    cumulative_module_sizes: Vec<u64>,
+    cumulative_module_size: u64,
 }
 
 impl modules {
@@ -58,10 +58,10 @@ pub unsafe fn load_modules(&mut self, pid: u32){
             let module_size = entry.modBaseSize as usize;
             let path = entry.szExePath;
 
-            let mut this_module = module::new(base_address as u32, module_size as u32, index, path);
+            let mut this_module = module::new(base_address as u64, module_size as u64, index, path);
 
-            self.cumulative_module_size += module_size as u32;
-            self.cumulative_module_sizes.push(module_size as u32);
+            self.cumulative_module_size += module_size as u64;
+            self.cumulative_module_sizes.push(module_size as u64);
 
             // Allocate buffer for module data
             let mut buffer = vec![0u8; module_size];
@@ -76,19 +76,22 @@ pub unsafe fn load_modules(&mut self, pid: u32){
                     module_size,
                     Some(&mut bytes_read)
                 );
-            println!("bytes_read: {}", bytes_read);
+            print!("bytes_read: {}", bytes_read);
+            print!(" Module size: {}", module_size);
+            println!(" for index: {}", index);
+
             if result.is_ok() {
-                buffer.truncate(bytes_read); // Adjust buffer to bytes actually read
+                //buffer.truncate(bytes_read); // Adjust buffer to bytes actually read
                 this_module.dirty_data = Some(buffer);
-                index += 1;
                 this_module.valid = Some(true);
                 self.modules.push(this_module);
+                index += 1;
             } else {
                 let err = unsafe { GetLastError() };
                 eprintln!("Failed to read module at {base_address:p}: {}", Error::from(err));
-                index += 1;
                 this_module.valid = Some(false);
                 self.modules.push(this_module);
+                index += 1;
             }
             // Move to next module
             match unsafe { Module32Next(snapshot, &mut entry) } {
@@ -104,7 +107,7 @@ pub unsafe fn load_modules(&mut self, pid: u32){
         }
         println!("Loaded {} modules from memory", self.modules.len());
 
-    }
+}
 
     /// Retrieve a module by (partial) filename.
     // pub fn get_module(&self, name: &str) -> Option<&module> {
