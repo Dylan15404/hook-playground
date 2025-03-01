@@ -37,7 +37,7 @@ use windows::{
 
 pub struct module {
     /// The index of which the module is loaded in memory
-    pub index: u8,
+    pub index: u16,
 
     /// The name of the module if exists
     pub name: Option<[i8; 260]>,
@@ -60,10 +60,14 @@ pub struct module {
     /// name and file path of the file of the module on disk
     pub file_path: [i8; 260],
 
+    ///vector to show which pages are valid or not
+    pub pages_valid: Vec<bool>,
+
+
 }
 
 impl module {
-    pub fn new( virtual_base: u64, virtual_size: u64, index: u8, file_path: [i8; 260]) -> Self {
+    pub fn new( virtual_base: u64, virtual_size: u64, index: u16, file_path: [i8; 260]) -> Self {
         Self {
             index,
             name: None, // Wrap in Some since it's provided
@@ -73,6 +77,7 @@ impl module {
             dirty_data: None,   // Optional, set to None
             clean_data: None,   // Optional, set to None
             file_path,
+            pages_valid: Vec::new(),
         }
     }
 

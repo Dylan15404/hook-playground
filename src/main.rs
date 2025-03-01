@@ -647,7 +647,6 @@ fn main() {
         modules.load_modules(pid);
         if let Some(buffer) = modules.modules[0].get_dirty_buffer() {
             println!("Module loaded successfully");
-            println!("buffer: {:?}", buffer);
             attempt(buffer.clone()); // Clone if attempt needs ownership
         } else {
             println!("No valid dirty buffer available");

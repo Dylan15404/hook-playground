@@ -6,6 +6,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Mo
 use windows::core::{Error, Result};
 use std::ptr::null_mut;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use crate::is_valid_process_handle;
 use crate::utils::get_process_handle;
 
@@ -44,61 +45,98 @@ pub unsafe fn load_modules(&mut self, pid: u32){
         };
         println!("Module entry size: {}", size_of::<MODULEENTRY32>());
 
+        // Get system page size
+        let mut system_info: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut system_info);
+        let page_size = system_info.dwPageSize as usize;
+
 
         Module32First(snapshot, &mut entry).unwrap();
 
         let overall_bytes_read = 0;
-        let mut index = 0;
+        let mut index= 0;
 
+        //loop to iterate through the modules
         loop {
 
-
             // Capture module data
-            let base_address = entry.modBaseAddr;
+            let base_address = entry.modBaseAddr as u64;
             let module_size = entry.modBaseSize as usize;
+            let end_address = base_address + module_size as u64;
             let path = entry.szExePath;
 
-            let mut this_module = module::new(base_address as u64, module_size as u64, index, path);
+            //set current address to base address for the start of the module so it can iterate through pages
+            let mut current_address = base_address;
 
             self.cumulative_module_size += module_size as u64;
             self.cumulative_module_sizes.push(module_size as u64);
 
+            let mut pages_valid: Vec<bool> = Vec::new();
+
             // Allocate buffer for module data
             let mut buffer = vec![0u8; module_size];
-            let mut bytes_read = 0;
+            let mut total_bytes_read = 0;
 
-            // Read process memory
-            let result =
-                ReadProcessMemory(
-                    process_handle,
-                    base_address as _,
-                    buffer.as_mut_ptr() as _,
-                    module_size,
-                    Some(&mut bytes_read)
-                );
-            print!("bytes_read: {}", bytes_read);
+            //loop to iterate through the pages
+            while current_address < end_address {
+
+                //page buffer the lower of remaining or page_size to make sure it doesn't read over the boundary
+                let remaining = end_address - current_address;
+                let read_size = std::cmp::min(remaining, page_size as u64);
+                let mut page_buffer = vec![0u8; read_size as usize];
+
+                let mut bytes_read = 0;
+
+                // Read process memory
+                let result =
+                    ReadProcessMemory(
+                        process_handle,
+                        current_address as _,
+                        page_buffer.as_mut_ptr() as _,
+                        read_size as usize,
+                        Some(&mut bytes_read)
+                    );
+
+
+                if result.is_ok() {
+                    let offset = (current_address - base_address) as usize;
+                    buffer[offset..offset + bytes_read].copy_from_slice(&page_buffer);
+                    total_bytes_read += bytes_read;
+                    pages_valid.push(true);
+                } else {
+                    let err = unsafe { GetLastError() };
+                    eprintln!("Failed page @ {current_address}: {} ({} bytes read)",
+                              Error::from(err),
+                              bytes_read
+                    );
+                    pages_valid.push(false);
+                }
+                current_address += read_size;
+            }
+
+            print!("bytes_read: {}", total_bytes_read);
             print!(" Module size: {}", module_size);
             println!(" for index: {}", index);
+            //println!("pages valid: {:?}", pages_valid);
 
-            if result.is_ok() {
-                //buffer.truncate(bytes_read); // Adjust buffer to bytes actually read
-                this_module.dirty_data = Some(buffer);
-                this_module.valid = Some(true);
-                self.modules.push(this_module);
-                index += 1;
-            } else {
-                let err = unsafe { GetLastError() };
-                eprintln!("Failed to read module at {base_address:p}: {}", Error::from(err));
-                this_module.valid = Some(false);
-                self.modules.push(this_module);
-                index += 1;
-            }
-            // Move to next module
-            match unsafe { Module32Next(snapshot, &mut entry) } {
-                Ok(_) => continue,
-                Err(_) => break,
+            //make module object
+            let mut this_module = module::new(base_address, module_size as u64, index, entry.szExePath);
+
+            this_module.dirty_data = Some(buffer);
+            this_module.valid = Some(total_bytes_read > 0);
+            this_module.pages_valid = pages_valid;
+            self.modules.push(this_module);
+
+            match Module32Next(snapshot, &mut entry) {
+                Ok(_) => index += 1,
+                Err(e) => {
+                    println!("Finished processing {} modules", index + 1);
+                    break;
+                }
             }
         }
+
+
         if let Err(e) = CloseHandle(snapshot) {
             eprintln!("Failed to close snapshot handle: {}", e);
         }
@@ -106,7 +144,6 @@ pub unsafe fn load_modules(&mut self, pid: u32){
             eprintln!("Failed to close process handle: {}", e);
         }
         println!("Loaded {} modules from memory", self.modules.len());
-
 }
 
     /// Retrieve a module by (partial) filename.
