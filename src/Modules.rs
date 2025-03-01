@@ -114,9 +114,12 @@ pub unsafe fn load_modules(&mut self, pid: u32){
                 current_address += read_size;
             }
 
-            print!("bytes_read: {}", total_bytes_read);
-            print!(" Module size: {}", module_size);
-            println!(" for index: {}", index);
+            println!("bytes_read: {}", total_bytes_read);
+            println!("Module size: {}", module_size);
+            println!("Base address: {}", base_address);
+            println!("For index: {}", index);
+            println!("/////////////////////////////////");
+
             //println!("pages valid: {:?}", pages_valid);
 
             //make module object

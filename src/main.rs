@@ -1,6 +1,7 @@
 mod utils;
 mod Modules;
 mod Module;
+mod Function;
 
 use Modules::*;
 use utils::{get_pid, get_process_handle, get_running_module_handle, get_static_module_handle};
@@ -10,6 +11,7 @@ use std::ptr;
 use std::ptr::{copy_nonoverlapping, null_mut};
 use capstone::arch::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::{arch, Capstone, Insn};
+use pelite::pe64::PeView;
 use widestring::WideCString;
 use windows::{
     core::*,
@@ -464,72 +466,6 @@ fn get_function_bytes(target_module: &str, target_function: &str, num_bytes: usi
 }
 
 
-/*
-fn get_process_modules(process_handle: HANDLE) -> Option<ProcessModules> {
-    let mut memory_info = MEMORY_BASIC_INFORMATION::default();
-    let mut module_list: Vec<MODULEINFO> = Vec::new();
-    let mut last_module_path = String::new();
-
-    unsafe {
-        let mut current_address: *const c_void = std::ptr::null(); // Properly typed as *const c_void
-
-        while VirtualQueryEx(
-            process_handle,
-            Option::from(current_address),
-            &mut memory_info,
-            size_of::<MEMORY_BASIC_INFORMATION>(),
-        ) != 0 {
-            // Ensure the memory region is an image (executable code, DLLs, etc.)
-            if memory_info.Type != MEM_IMAGE {
-                current_address = (memory_info.BaseAddress as usize + memory_info.RegionSize) as *mut _;
-                continue;
-            }
-
-            // Retrieve the module's full file path
-            let mut file_path_buffer = vec![0u16; 260];
-            let file_path_length = GetProcessImageFileNameW(
-                process_handle,
-                &mut *file_path_buffer,
-            ) as usize;
-            if file_path_length == 0 {
-                current_address = (memory_info.BaseAddress as usize + memory_info.RegionSize) as *mut _;
-                continue;
-            }
-
-            let mut file_path = WideCString::from_vec_truncate(&file_path_buffer[..file_path_length])
-                .to_string_lossy();
-
-
-            // If the same module spans multiple regions, merge the sizes
-            if file_path == last_module_path {
-                if let Some(last_module) = module_list.last_mut() {
-                    *last_module.virtual_size() += memory_info.RegionSize;
-                }
-                current_address = (memory_info.BaseAddress as usize + memory_info.RegionSize) as *mut _;
-                continue;
-            }
-
-            last_module_path = file_path.clone();
-
-            let new_module = MODULEINFO::new(
-                memory_info.BaseAddress,
-                memory_info.RegionSize,
-                file_path);
-
-            module_list.push(new_module);
-
-            current_address = (memory_info.BaseAddress as usize + memory_info.RegionSize) as *mut _;
-
-        }
-
-        if module_list.is_empty() {
-            None
-        } else {
-            Some(ProcessModules { modules: module_list })
-        }
-    }
-}*/
-
 pub fn is_valid_process_handle(handle: HANDLE) -> bool {
     let mut exit_code: u32 = 0;
     unsafe {
@@ -541,118 +477,53 @@ pub fn is_valid_process_handle(handle: HANDLE) -> bool {
 }
 
 
-
-
-unsafe fn get_modules(pid: u32) -> Result<Vec<Vec<u8>>> {
-    let process_handle = get_process_handle(pid)?;
-    println!("handle valid: {}", is_valid_process_handle(process_handle));
-
-    // Create a snapshot of the modules in the process
-    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)?;
-    println!("Creating snapshot for PID: {}", pid);
-    println!("Snapshot handle: {:?}", snapshot);
-
-    // Initialize the module entry structure
-    let mut modules = Vec::new();
-    let mut entry = MODULEENTRY32 {
-        dwSize: size_of::<MODULEENTRY32>() as u32,
-        ..Default::default()
-    };
-    println!("Module entry size: {}", size_of::<MODULEENTRY32>());
-
-    Module32First(snapshot, &mut entry) ?;
-
-    loop {
-        // Capture module data
-        let base_address = entry.modBaseAddr;
-        let module_size = entry.modBaseSize as usize;
-        let path = entry.szExePath;
-
-
-        // Allocate buffer for module data
-        let mut buffer = vec![0u8; module_size];
-        let mut bytes_read = 0;
-
-        // Read process memory
-        let result =
-            ReadProcessMemory(
-                process_handle,
-                base_address as _,
-                buffer.as_mut_ptr() as _,
-                module_size,
-                Some(&mut bytes_read)
-            );
-        println!("bytes_read: {}", bytes_read);
-        if result.is_ok() {
-            buffer.truncate(bytes_read); // Adjust buffer to bytes actually read
-            modules.push(buffer);
-        } else {
-            let err = unsafe { GetLastError() };
-            eprintln!("Failed to read module at {base_address:p}: {}", Error::from(err));
-        }
-        // Move to next module
-        match unsafe { Module32Next(snapshot, &mut entry) } {
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    if let Err(e) = CloseHandle(snapshot) {
-        eprintln!("Failed to close snapshot handle: {}", e);
-    }
-    if let Err(e) = CloseHandle(process_handle) {
-        eprintln!("Failed to close process handle: {}", e);
-    }
-    println!("Loaded {} modules from memory", modules.len());
-    Ok(modules)
-
-}
-
-
-
-fn attempt(buffer: Vec<u8>) {
-    use goblin::pe::PE;
+unsafe fn attempt(buffer: Vec<u8>)  -> Result<()> {
     use std::fs::File;
     use std::io::Read;
+    use pelite::pe64::{Pe, PeFile};
+    // Create a PeView from the byte slice
+    let pe = PeView::from_bytes(&buffer).unwrap();
 
+    // Get the import directory
+    let imports = pe.imports().unwrap();
 
-        match PE::parse(&buffer) {
-            Ok(pe) => {
-                println!("PE file parsed successfully");
+    // Iterate through the import descriptors
+    for desc in imports {
+        let dll_name = desc.dll_name().unwrap();
+        println!("DLL: {}", dll_name);
 
-                // Inspect the Export Address Table (EAT)
-                for export in pe.exports {
-                    println!(
-                        "Function: {}, Address: {:x}",
-                        export.name.unwrap_or("unknown"),
-                        export.rva
-                    );
-                }
+        // Get the IAT and INT (Import Name Table)
+        let iat = desc.iat().unwrap();
+        let names = desc.int().unwrap();
 
-                // Inspect the Import Address Table (IAT)
-                for import in pe.imports {
-                    println!("Import: {}, Address: {:x}", import.name, import.rva);
-                }
-            },
-            Err(e) => println!("Failed to parse PE file: {}", e),
+        // Zip the IAT virtual addresses with their corresponding import entries
+        for (va, entry) in iat.zip(names) {
+            match entry {
+                Ok(import) => match import {
+                    pelite::pe::imports::Import::ByName { name, .. } => {
+                        println!("  Import: {} at VA: {:#x}", name, va)
+                    }
+                    pelite::pe::imports::Import::ByOrdinal { ord } => {
+                        println!("  Ordinal: {} at VA: {:#x}", ord, va)
+                    }
+                },
+                Err(e) => println!("  Error: {:?}", e),
+            }
         }
+    }
+
+    Ok(())
 }
 fn main() {
 
     unsafe {
-        let pid = get_pid("DiscordPTB.exe").unwrap();
+        let pid = get_pid("msedge.exe").unwrap();
 
         //let header = get_modules(pid).expect("get_modules failed");
         //attempt(header);
         let mut modules = Modules::modules::new();
         modules.load_modules(pid);
-        if let Some(buffer) = modules.modules[0].get_dirty_buffer() {
-            println!("Module loaded successfully");
-            attempt(buffer.clone()); // Clone if attempt needs ownership
-        } else {
-            println!("No valid dirty buffer available");
-        }
-
-
+        modules.modules[0].read_header();
 
         /*
 
