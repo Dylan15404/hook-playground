@@ -1,4 +1,6 @@
 use std::ffi::{CStr, CString};
+use pelite::pe::Va;
+use winapi::ctypes::c_void;
 use windows::core::{Error, PCSTR};
 use windows::Win32::Foundation::{CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_PROTECT_FROM_CLOSE, HMODULE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Module32First, Module32Next, Process32First, Process32Next, MODULEENTRY32, PROCESSENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPPROCESS};
@@ -6,8 +8,7 @@ use windows::Win32::System::LibraryLoader::LoadLibraryA;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
 
 // function to get the pid of a process with a given name
-
-pub(crate) fn get_pid(process_name: &str) -> std::result::Result<u32, Error> {
+pub(crate) fn get_pid(process_name: &str) -> Result<u32, Error> {
     unsafe {
         // create a snapshot of all the processes
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;

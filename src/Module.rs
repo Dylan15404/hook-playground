@@ -2,7 +2,8 @@ use crate::Function;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use pelite::pe64::{Pe, PeFile, PeView};
+use pelite::pe;
+use pelite::pe::{Pe, PeFile, PeView, imports::Import};
 use windows::{
     core::*,
     Win32::{
@@ -46,10 +47,13 @@ pub struct module {
     pub valid: Option<bool>,
 
     /// The address of the module loaded in the process memory.
-    pub virtual_base: u64,
+    pub module_base: u64,
 
     /// The size (in bytes) of the module as loaded.
-    pub virtual_size: u64,
+    pub module_size: u64,
+
+    /// The address of the module loaded in the process memory.
+    pub process_base: u64,
 
     /// The data (Vec<u8> of bytes) of the module loaded from the dirty process' memory
     pub dirty_data: Option<Vec<u8>>,
@@ -67,24 +71,25 @@ pub struct module {
     pub functions: Vec<Function::function>,
 
     ///dictionary of iat offsets 
-    pub iat_dict: HashMap<String, u64>,
+    pub iat_dict: HashMap<String, (u64, String)>,
 
 }
 
 impl module {
-    pub fn new( virtual_base: u64, virtual_size: u64, index: u16, file_path: [i8; 260]) -> Self {
+    pub fn new(process_base: u64, module_base: u64, module_size: u64, index: u16, file_path: [i8; 260]) -> Self {
         Self {
             index,
             name: None, // Wrap in Some since it's provided
             valid: None, // Wrap in Some since it's provided
-            virtual_base,
-            virtual_size,
+            module_base,
+            module_size,
             dirty_data: None,   // Optional, set to None
             clean_data: None,   // Optional, set to None
             file_path,
             pages_valid: Vec::new(),
             functions: Vec::new(),
             iat_dict: HashMap::new(),
+            process_base,
         }
     }
 
@@ -96,13 +101,14 @@ impl module {
         }
     }
 
-    pub fn read_header(&self) -> Result<()> {
-        // Create a PeView from the byte slice
+    pub fn read_header(&mut self) -> Result<()> {
 
+        // Create a PeView from the byte slice
         let dirty_data = self.dirty_data.as_ref().expect("dirty_data should not be None");
-        let base_address = self.virtual_base;
+        let base_address = self.process_base;
         println!("base_address {:#X}", base_address);
 
+        //
         let pe = PeView::from_bytes(dirty_data).unwrap();
 
         // Get the import directory
@@ -121,8 +127,10 @@ impl module {
             for (va, entry) in iat.zip(names) {
                 match entry {
                     Ok(import) => match import {
-                        pelite::pe::imports::Import::ByName { name, .. } => {
-                            println!("  Import: {} at VA: {:#x}", name, va - base_address);
+                        Import::ByName { name, .. } => {
+                            println!("  Import: {} at VA: {:#x}", name, va);
+
+                            self.iat_dict.insert(name.to_string(), (*va as u64, dll_name.to_string()));
                         }
                         pelite::pe::imports::Import::ByOrdinal { ord } => {
                             println!("  Ordinal: {} at VA: {:#x}", ord, va)

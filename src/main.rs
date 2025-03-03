@@ -521,9 +521,9 @@ fn main() {
 
         //let header = get_modules(pid).expect("get_modules failed");
         //attempt(header);
-        let mut modules = Modules::modules::new();
+        let mut modules = modules::new();
         modules.load_modules(pid);
-        modules.modules[0].read_header();
+        modules.read_modules().unwrap();
 
         /*
 
