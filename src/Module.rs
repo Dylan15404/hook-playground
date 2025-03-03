@@ -1,9 +1,11 @@
 use crate::Function;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io;
+use std::io::{ErrorKind, Read};
 use pelite::pe;
 use pelite::pe::{Pe, PeFile, PeView, imports::Import};
+use pelite::pe::imports::Imports;
 use windows::{
     core::*,
     Win32::{
@@ -35,13 +37,14 @@ use windows::{
 
     }
 };
+use windows::Win32::Foundation::{CloseHandle, GetLastError};
 
 pub struct module {
     /// The index of which the module is loaded in memory
     pub index: u16,
 
     /// The name of the module if exists
-    pub name: Option<[i8; 260]>,
+    pub name: Option<String>,
 
     /// whether the module is valid to be read
     pub valid: Option<bool>,
@@ -51,9 +54,6 @@ pub struct module {
 
     /// The size (in bytes) of the module as loaded.
     pub module_size: u64,
-
-    /// The address of the module loaded in the process memory.
-    pub process_base: u64,
 
     /// The data (Vec<u8> of bytes) of the module loaded from the dirty process' memory
     pub dirty_data: Option<Vec<u8>>,
@@ -76,7 +76,7 @@ pub struct module {
 }
 
 impl module {
-    pub fn new(process_base: u64, module_base: u64, module_size: u64, index: u16, file_path: [i8; 260]) -> Self {
+    pub fn new(module_base: u64, module_size: u64, index: u16, file_path: [i8; 260]) -> Self {
         Self {
             index,
             name: None, // Wrap in Some since it's provided
@@ -89,7 +89,6 @@ impl module {
             pages_valid: Vec::new(),
             functions: Vec::new(),
             iat_dict: HashMap::new(),
-            process_base,
         }
     }
 
@@ -103,25 +102,68 @@ impl module {
 
     pub fn read_header(&mut self) -> Result<()> {
 
-        // Create a PeView from the byte slice
-        let dirty_data = self.dirty_data.as_ref().expect("dirty_data should not be None");
-        let base_address = self.process_base;
-        println!("base_address {:#X}", base_address);
+        // Check if dirty_data exists
+        let dirty_data = match self.dirty_data.as_ref() {
+            Some(data) => data,
+            None => {
+                let err = unsafe { GetLastError() };
+                println!("Error: dirty_data is None");
+                return Err(Error::from(err));
+            }
+        };
 
-        //
-        let pe = PeView::from_bytes(dirty_data).unwrap();
+
+        // Create a PeView from the byte slice
+        let pe = match PeView::from_bytes(dirty_data) {
+            Ok(pe) => pe,
+            Err(e) => {
+                let err = unsafe { GetLastError() };
+                println!("Error creating PeView: {:?}", e);
+                self.valid = Some(false);
+                return Err(Error::from(err));
+            }
+        };
+
 
         // Get the import directory
-        let imports = pe.imports().unwrap();
+        let imports = match pe.imports() {
+            Ok(imports) => imports,
+            Err(e) => {
+                let err = unsafe { GetLastError() };
+                println!("Error getting imports: {:?}", e);
+                self.valid = Some(false);
+                return Err(Error::from(err));
+            }
+        };
 
         // Iterate through the import descriptors
         for desc in imports {
-            let dll_name = desc.dll_name().unwrap();
+            //get dll name for current section of the IAT
+            let dll_name = match desc.dll_name() {
+                Ok(name) => name,
+                Err(e) => {
+                    println!("Error getting DLL name: {:?}", e);
+                    continue; // Skip to next descriptor
+                }
+            };
             println!("DLL: {}", dll_name);
 
             // Get the IAT and INT (Import Name Table)
-            let iat = desc.iat().unwrap();
-            let names = desc.int().unwrap();
+            let iat = match desc.iat() {
+                Ok(iat) => iat,
+                Err(e) => {
+                    println!("Error getting IAT for {}: {:?}", dll_name, e);
+                    continue; // Skip to next descriptor
+                }
+            };
+
+            let names = match desc.int() {
+                Ok(names) => names,
+                Err(e) => {
+                    println!("Error getting INT for {}: {:?}", dll_name, e);
+                    continue; // Skip to next descriptor
+                }
+            };
 
             // Zip the IAT virtual addresses with their corresponding import entries
             for (va, entry) in iat.zip(names) {

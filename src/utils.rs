@@ -124,3 +124,31 @@ pub(crate) fn get_static_module_handle(module_name: &str) -> windows::core::Resu
         }
     }
 }
+
+pub(crate) fn bytes_to_ascii(bytes: [u8; 260]) -> String {
+    // Convert bytes to String, replacing invalid ASCII with replacement character
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+pub(crate) fn windows_i8_path_to_string(path: [i8; 260]) -> String {
+    // Convert i8 to u8 array
+    let u8_path: [u8; 260] = path.map(|b| b as u8);
+
+    // Find the null terminator (if any) and convert to string
+    let null_pos = u8_path.iter().position(|&x| x == 0).unwrap_or(260);
+
+    // Convert valid bytes to string, assuming UTF-8 or ANSI encoding
+    String::from_utf8_lossy(&u8_path[..null_pos]).into_owned()
+}
+
+pub(crate) fn windows_i8_path_to_filename(path: [i8; 260]) -> String {
+    // First convert to String using previous function
+    let full_path = windows_i8_path_to_string(path);
+
+    // Find the last backslash and extract filename
+    full_path
+        .rsplit('\\')  // Split from the right on backslash
+        .next()       // Take the last segment (filename)
+        .unwrap_or(&full_path) // Fallback to full path if no backslash
+        .to_string()
+}
